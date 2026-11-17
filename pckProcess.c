@@ -26,7 +26,7 @@
 #define PCK_ALIGNMENT_V3 (32)
 #define AES_BLOCK_SIZE   (16)
 
-// Binary wire sizes (explicit constants avoid compiler padding ambiguity)
+// Binary wire sizes
 #define PCK_HEADER_PREFIX_SIZE   (20)
 #define PCK_HEADER_V1_SIZE       (84)
 #define PCK_HEADER_V2_SIZE       (96)
@@ -36,6 +36,7 @@
 #define PCK_EMBED_FOOTER_SIZE    (12)
 
 #define PCK_STREAM_CHUNK_SIZE    (65536)
+#define PCK_TERM_COLS            (60)
 
 // Folder name used on disk when unpacking user:// entries
 #define USER_SCHEME_DIR "__user__"
@@ -61,7 +62,19 @@ static size_t _PckCleanNameLen(const char* content, u32 rawSize) {
 }
 
 static void _PckPrintRule(void) {
-    printf("------------------------------------------------------------\n");
+    char rule[PCK_TERM_COLS + 1];
+    memset(rule, '-', PCK_TERM_COLS);
+    rule[PCK_TERM_COLS] = '\0';
+    printf("%s\n", rule);
+}
+
+static void _PckPrintLine60(const char* text) {
+    size_t len = strlen(text);
+    if (len <= PCK_TERM_COLS) {
+        printf("%s\n", text);
+    } else {
+        printf("%.*s...\n", PCK_TERM_COLS - 3, text);
+    }
 }
 
 static void _PckTruncatePath(const char* src, size_t srcLen, char* dst, size_t maxCols) {
@@ -79,6 +92,42 @@ static void _PckTruncatePath(const char* src, size_t srcLen, char* dst, size_t m
     memcpy(dst, "...", 3);
     memcpy(dst + 3, src + (srcLen - keep), keep);
     dst[maxCols] = '\0';
+}
+
+static bool _PckMatchesFilter(const char* namePtr, size_t nameLen, const PckFilterOptions* filterOpts) {
+    if (!filterOpts || filterOpts->count == 0)
+        return true;
+
+    size_t lastSlash = 0;
+    bool hasSlash = false;
+    for (size_t i = 0; i < nameLen; i++) {
+        if (namePtr[i] == '/') {
+            lastSlash = i + 1;
+            hasSlash = true;
+        }
+    }
+
+    size_t start = hasSlash ? lastSlash : 0;
+    size_t lastDot = nameLen;
+    for (size_t i = start; i < nameLen; i++) {
+        if (namePtr[i] == '.')
+            lastDot = i;
+    }
+
+    if (lastDot >= nameLen)
+        return false;
+
+    const char* entryExt = namePtr + lastDot;
+    size_t entryExtLen = nameLen - lastDot;
+
+    for (u32 i = 0; i < filterOpts->count; i++) {
+        const char* target = filterOpts->extensions[i];
+        size_t targetLen = strlen(target);
+        if (targetLen == entryExtLen && strncasecmp(entryExt, target, entryExtLen) == 0)
+            return true;
+    }
+
+    return false;
 }
 
 // Resolves standalone .pck or embedded PCK inside Windows .exe / Linux / macOS binary
@@ -291,42 +340,6 @@ static void _PckFormatSize(u64 sizeInBytes, char* stringRep, size_t bufSize) {
     }
 }
 
-static bool _PckMatchesFilter(const char* namePtr, size_t nameLen, const PckFilterOptions* filterOpts) {
-    if (!filterOpts || filterOpts->count == 0)
-        return true;
-
-    size_t lastSlash = 0;
-    bool hasSlash = false;
-    for (size_t i = 0; i < nameLen; i++) {
-        if (namePtr[i] == '/') {
-            lastSlash = i + 1;
-            hasSlash = true;
-        }
-    }
-
-    size_t start = hasSlash ? lastSlash : 0;
-    size_t lastDot = nameLen;
-    for (size_t i = start; i < nameLen; i++) {
-        if (namePtr[i] == '.')
-            lastDot = i;
-    }
-
-    if (lastDot >= nameLen)
-        return false;
-
-    const char* entryExt = namePtr + lastDot;
-    size_t entryExtLen = nameLen - lastDot;
-
-    for (u32 i = 0; i < filterOpts->count; i++) {
-        const char* target = filterOpts->extensions[i];
-        size_t targetLen = strlen(target);
-        if (targetLen == entryExtLen && strncasecmp(entryExt, target, entryExtLen) == 0)
-            return true;
-    }
-
-    return false;
-}
-
 typedef struct {
     const u8* dataBase;
     u64 maxDataSpan;
@@ -465,19 +478,22 @@ void PckExtractAll(
     PckResolvedView view = _PckResolveView(pckData, pckSize);
     MD5Context md5Context = _PckCreateMD5Context();
     PckDirSession sess = _PckOpenDirSession(&view, decryptOpts, md5Context);
+    bool hasFilter = (filterOpts && filterOpts->count > 0);
 
-    bool hasFilter = (filterOpts != NULL && filterOpts->count > 0);
-    u32 extractedCount = 0;
-
-    printf("Unpack v%u (Godot %u.%u.%u)%s%s | %u files\n",
-           sess.formatVersion,
-           sess.engineVersion.majorVersion,
-           sess.engineVersion.minorVersion,
-           sess.engineVersion.patchVersion,
-           view.isEmbedded ? " [EMB]" : "",
-           hasFilter ? " [FILTER]" : "",
-           sess.fileCount);
+    // 60-col header: "Unpack v3 | Godot 4.6.0 [EMB] [FLT] | 99999 files"
+    char headerBuf[128];
+    snprintf(headerBuf, sizeof(headerBuf), "Unpack v%u | Godot %u.%u.%u%s%s | %u files",
+             sess.formatVersion,
+             sess.engineVersion.majorVersion,
+             sess.engineVersion.minorVersion,
+             sess.engineVersion.patchVersion,
+             view.isEmbedded ? " [EMB]" : "",
+             hasFilter ? " [FLT]" : "",
+             sess.fileCount);
+    _PckPrintLine60(headerBuf);
     _PckPrintRule();
+
+    u32 extractedCount = 0;
 
     for (u32 i = 0; i < sess.fileCount; i++) {
         PckParsedEntry entry;
@@ -486,16 +502,17 @@ void PckExtractAll(
         if (!_PckMatchesFilter(entry.namePtr, entry.nameLen, filterOpts))
             continue;
 
+        // 60-col row: "  <41-char path> <9-char size> <6-char status>" = 2 + 41 + 1 + 9 + 1 + 6 = 60
         char sizeStr[16];
-        char shortName[48];
+        char shortName[44];
         _PckFormatSize(entry.dataSize, sizeStr, sizeof(sizeStr));
-        _PckTruncatePath(entry.namePtr, entry.nameLen, shortName, 44);
+        _PckTruncatePath(entry.namePtr, entry.nameLen, shortName, 41);
 
-        printf("  %-44s %9s", shortName, sizeStr);
+        printf("  %-41s %9s ", shortName, sizeStr);
         fflush(stdout);
 
         if (entry.flags & PCK_FILE_FLAG_REMOVAL) {
-            printf("  SKIP (DEL)\n");
+            printf("   DEL\n");
             continue;
         }
 
@@ -546,9 +563,6 @@ void PckExtractAll(
             panic("PckExtractAll: MD5 mismatch (expected %s, got %s)", hashA, hashB);
         }
 
-        // Map Godot URI schemes cleanly onto local folders:
-        //   res://foo/bar  -> <out>/foo/bar
-        //   user://foo/bar -> <out>/__user__/foo/bar
         const char* relPath = entry.namePtr;
         size_t relLen = entry.nameLen;
         bool isUserScheme = false;
@@ -598,12 +612,14 @@ void PckExtractAll(
             free(decryptedFileBuf);
 
         extractedCount++;
-        printf("  OK\n");
+        printf("    OK\n");
     }
 
     _PckPrintRule();
     if (hasFilter) {
-        printf("Extracted %u / %u files\n", extractedCount, sess.fileCount);
+        char footerBuf[128];
+        snprintf(footerBuf, sizeof(footerBuf), "Extracted: %u / %u files", extractedCount, sess.fileCount);
+        _PckPrintLine60(footerBuf);
     }
 
     _PckCloseDirSession(&sess);
@@ -633,6 +649,7 @@ void PckListAll(
     PckResolvedView view = _PckResolveView(pckData, pckSize);
     MD5Context md5Context = _PckCreateMD5Context();
     PckDirSession sess = _PckOpenDirSession(&view, decryptOpts, md5Context);
+    bool hasFilter = (filterOpts && filterOpts->count > 0);
 
     if ((u64)sess.fileCount * (sizeof(u32) + PCK_ENTRY_V1_SIZE) > (u64)(sess.dirEnd - sess.dirCursor))
         panic("PckListAll: Declared fileCount (%u) exceeds directory buffer size", sess.fileCount);
@@ -641,7 +658,6 @@ void PckListAll(
     if (!items)
         panic("PckListAll: calloc failed");
 
-    bool hasFilter = (filterOpts != NULL && filterOpts->count > 0);
     u32 matchedCount = 0;
     u64 matchedPayloadBytes = 0;
 
@@ -666,17 +682,21 @@ void PckListAll(
 
     qsort(items, matchedCount, sizeof(PckListEntry), _CompareListEntriesDesc);
 
-    printf("PCK v%u | Godot %u.%u.%u%s%s%s | %u files\n",
-           sess.formatVersion,
-           sess.engineVersion.majorVersion,
-           sess.engineVersion.minorVersion,
-           sess.engineVersion.patchVersion,
-           view.isEmbedded ? " | EMB" : "",
-           sess.isDirEncrypted ? " | ENC" : "",
-           hasFilter ? " | FILTER" : "",
-           sess.fileCount);
+    // 60-col header
+    char headerBuf[128];
+    snprintf(headerBuf, sizeof(headerBuf), "PCK v%u | Godot %u.%u.%u%s%s%s | %u files",
+             sess.formatVersion,
+             sess.engineVersion.majorVersion,
+             sess.engineVersion.minorVersion,
+             sess.engineVersion.patchVersion,
+             view.isEmbedded ? " [EMB]" : "",
+             sess.isDirEncrypted ? " [ENC]" : "",
+             hasFilter ? " [FLT]" : "",
+             sess.fileCount);
+    _PckPrintLine60(headerBuf);
     _PckPrintRule();
-    printf("%9s %-44s %4s\n", "SIZE", "ASSET", "FLAG");
+    // 9 + 1 + 44 + 1 + 5 = 60 columns
+    printf("%9s %-44s %5s\n", "SIZE", "ASSET", "FLAG");
     _PckPrintRule();
 
     for (u32 i = 0; i < matchedCount; i++) {
@@ -688,33 +708,34 @@ void PckListAll(
         const char* flagStr = (items[i].flags & PCK_FILE_FLAG_ENCRYPTED) ? "ENC" :
                               (items[i].flags & PCK_FILE_FLAG_REMOVAL)   ? "DEL" : "-";
 
-        printf("%9s %-44s %4s\n", sizeStr, shortName, flagStr);
+        printf("%9s %-44s %5s\n", sizeStr, shortName, flagStr);
         free(items[i].name);
     }
 
     free(items);
 
     char totalStr[24];
+    char footerBuf[128];
     _PckFormatSize(matchedPayloadBytes, totalStr, sizeof(totalStr));
     _PckPrintRule();
     if (hasFilter) {
-        printf("Total: %u / %u files | %s (%llu B)\n",
-               matchedCount,
-               sess.fileCount,
-               totalStr,
-               (unsigned long long)matchedPayloadBytes);
+        snprintf(footerBuf, sizeof(footerBuf), "Total: %u / %u files | %s (%llu B)",
+                 matchedCount,
+                 sess.fileCount,
+                 totalStr,
+                 (unsigned long long)matchedPayloadBytes);
     } else {
-        printf("Total: %u files | %s (%llu B)\n",
-               sess.fileCount,
-               totalStr,
-               (unsigned long long)matchedPayloadBytes);
+        snprintf(footerBuf, sizeof(footerBuf), "Total: %u files | %s (%llu B)",
+                 sess.fileCount,
+                 totalStr,
+                 (unsigned long long)matchedPayloadBytes);
     }
+    _PckPrintLine60(footerBuf);
 
     _PckCloseDirSession(&sess);
     _PckEndMD5Context(md5Context);
 }
 
-// Formats a local relative path back into a clean Godot URI (res:// or user://)
 static size_t _PckFormatGodotUri(const char* localRelPath, char* outBuf, size_t outBufSize) {
     while (*localRelPath == '/')
         localRelPath++;
@@ -903,35 +924,37 @@ void PckBuildToFile(
         totalPckSize      = dirSectionOffset + entrySectionSize;
     }
 
-    u8* streamBuf = malloc(PCK_STREAM_CHUNK_SIZE);
-    if (!streamBuf) {
-        free(fileSizes);
-        panic("PckBuildToFile: malloc failed for stream buffer");
-    }
-
     FILE* outFp = fopen(outputPath, "wb");
     if (!outFp) {
-        free(streamBuf);
         free(fileSizes);
         panic("PckBuildToFile: unable to create output file \"%s\"", outputPath);
     }
 
+    u8* streamBuf = malloc(PCK_STREAM_CHUNK_SIZE);
+    if (!streamBuf) {
+        fclose(outFp);
+        free(fileSizes);
+        panic("PckBuildToFile: malloc failed for stream buffer");
+    }
+
     u64 baseOffset = 0;
-    bool replacedExistingPck = false;
+    bool replacedExisting = false;
     if (embedExePath != NULL) {
-        _PckCopyExeStub(embedExePath, outFp, streamBuf, &baseOffset, &replacedExistingPck);
+        _PckCopyExeStub(embedExePath, outFp, streamBuf, &baseOffset, &replacedExisting);
     }
 
     char totalStr[24];
+    char headerBuf[128];
     _PckFormatSize(totalPckSize, totalStr, sizeof(totalStr));
-    printf("Pack v%u (Godot %u.%u.%u)%s | %u files | %s\n",
-           formatVersion,
-           engineVersion.majorVersion,
-           engineVersion.minorVersion,
-           engineVersion.patchVersion,
-           embedExePath ? (replacedExistingPck ? " [RE-EMBED]" : " [EMBED]") : "",
-           fileCount,
-           totalStr);
+    snprintf(headerBuf, sizeof(headerBuf), "Pack v%u | Godot %u.%u.%u%s | %u files | %s",
+             formatVersion,
+             engineVersion.majorVersion,
+             engineVersion.minorVersion,
+             engineVersion.patchVersion,
+             embedExePath ? (replacedExisting ? " [RE-EMB]" : " [EMB]") : "",
+             fileCount,
+             totalStr);
+    _PckPrintLine60(headerBuf);
     _PckPrintRule();
 
     // 1. Write PCK header at baseOffset
@@ -957,8 +980,8 @@ void PckBuildToFile(
     // 2. Allocate directory buffer in memory
     u8* dirBuf = calloc(1, (size_t)entrySectionSize);
     if (!dirBuf) {
-        fclose(outFp);
         free(streamBuf);
+        fclose(outFp);
         free(fileSizes);
         panic("PckBuildToFile: calloc failed for directory");
     }
@@ -967,11 +990,10 @@ void PckBuildToFile(
     write_u32_le(dirCursor, fileCount);
     dirCursor += sizeof(u32);
 
-    // Seek to start of data section inside the PCK region
     if (fseeko(outFp, (off_t)(baseOffset + dataSectionOffset), SEEK_SET) != 0) {
         free(dirBuf);
-        fclose(outFp);
         free(streamBuf);
+        fclose(outFp);
         free(fileSizes);
         panic("PckBuildToFile: fseeko to data section failed");
     }
@@ -984,11 +1006,12 @@ void PckBuildToFile(
         size_t rawNameLen = _PckFormatGodotUri(files[i].archivePath, uriBuf, sizeof(uriBuf));
         u64 paddedNameLen = _PckAlignU64(rawNameLen, PCK_ALIGNMENT_V2);
 
+        // 60-col row: "  <42-char path> <9-char size> <5-char status>" = 2 + 42 + 1 + 9 + 1 + 5 = 60
         char sizeStr[16];
-        char shortName[48];
+        char shortName[44];
         _PckFormatSize(fileSizes[i], sizeStr, sizeof(sizeStr));
-        _PckTruncatePath(uriBuf, rawNameLen, shortName, 44);
-        printf("  %-44s %9s", shortName, sizeStr);
+        _PckTruncatePath(uriBuf, rawNameLen, shortName, 42);
+        printf("  %-42s %9s ", shortName, sizeStr);
         fflush(stdout);
 
         write_u32_le(dirCursor, (u32)paddedNameLen);
@@ -1041,20 +1064,19 @@ void PckBuildToFile(
             _PckWriteZeros(outFp, padBytes);
 
         currentDataPos += alignedLen;
-        printf("  OK\n");
+        printf("   OK\n");
     }
 
-    // 4. Write directory table at baseOffset + dirSectionOffset
+    // 4. Write directory table
     if (fseeko(outFp, (off_t)(baseOffset + dirSectionOffset), SEEK_SET) != 0)
         panic("PckBuildToFile: fseeko to directory section failed");
 
     _PckWriteAll(outFp, dirBuf, (size_t)entrySectionSize);
 
-    // 5. If embedding into an executable, append the 12-byte footer at the end of the PCK
+    // 5. Append 12-byte embedded footer if bundling into an executable
     if (embedExePath != NULL) {
         if (fseeko(outFp, (off_t)(baseOffset + totalPckSize), SEEK_SET) != 0)
             panic("PckBuildToFile: fseeko to embedded footer failed");
-
         u8 footer[PCK_EMBED_FOOTER_SIZE];
         write_u64_le(footer, totalPckSize);
         write_u32_le(footer + sizeof(u64), GDPC_MAGIC);
