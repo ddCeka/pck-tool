@@ -3,6 +3,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
+#include <limits.h>
 
 #include "pckProcess.h"
 #include "files.h"
@@ -14,6 +15,7 @@ void usage(void) {
         "options:\n"
         "  --key <64-hex>       AES-256 hex decryption key\n"
         "  --key-file <path>    Read 64-char hex key from file\n"
+        "  --embed <exe>        Bundle packed PCK into a base Godot executable\n"
         "  --v1|--v2|--v3|--v4  Target pack version (default: v3)\n"
     );
     exit(1);
@@ -35,6 +37,20 @@ static void loadKeyFromFile(const char* keyPath, u8 outKey[32]) {
         panic("loadKeyFromFile: key file \"%s\" must contain 64 hex chars", keyPath);
 }
 
+static bool pathsReferToSameFile(const char* pathA, const char* pathB) {
+    if (!pathA || !pathB)
+        return false;
+    if (strcmp(pathA, pathB) == 0)
+        return true;
+
+    char realA[PATH_MAX];
+    char realB[PATH_MAX];
+    if (realpath(pathA, realA) && realpath(pathB, realB)) {
+        return strcmp(realA, realB) == 0;
+    }
+    return false;
+}
+
 int main(int argc, char** argv) {
     if (argc < 3)
         usage();
@@ -52,6 +68,7 @@ int main(int argc, char** argv) {
     }
 
     u32 targetFormatVersion = PCK_VERSION_LATEST;
+    const char* embedExePath = NULL;
     PckDecryptOptions decryptOpts = { .hasKey = false };
 
     for (int i = optStart; i < argc; i++) {
@@ -72,9 +89,16 @@ int main(int argc, char** argv) {
             if (i + 1 >= argc) usage();
             loadKeyFromFile(argv[++i], decryptOpts.key);
             decryptOpts.hasKey = true;
+        } else if (strcmp(argv[i], "--embed") == 0) {
+            if (i + 1 >= argc) usage();
+            embedExePath = argv[++i];
         } else {
             usage();
         }
+    }
+
+    if (embedExePath != NULL && strcasecmp(mode, "pack") != 0) {
+        panic("--embed can only be used with 'pack' mode");
     }
 
     if (strcasecmp(mode, "list") == 0) {
@@ -89,6 +113,10 @@ int main(int argc, char** argv) {
         FileDestroyHandle(fileHndl);
         printf("Done -> %s/\n", outputPath);
     } else if (strcasecmp(mode, "pack") == 0) {
+        if (embedExePath != NULL && pathsReferToSameFile(embedExePath, outputPath)) {
+            panic("--embed input executable and output path cannot be the same file");
+        }
+
         GetAllFilesResult r = getAllFiles(inputPath);
 
         PckBuildInput* buildFiles = malloc(sizeof(PckBuildInput) * (r.fileCount > 0 ? r.fileCount : 1));
@@ -108,7 +136,7 @@ int main(int argc, char** argv) {
             .patchVersion = 0
         };
 
-        PckBuildToFile(buildFiles, r.fileCount, outputPath, engineVersion, targetFormatVersion);
+        PckBuildToFile(buildFiles, r.fileCount, outputPath, embedExePath, engineVersion, targetFormatVersion);
 
         for (unsigned i = 0; i < r.fileCount; i++) {
             free(buildFiles[i].diskPath);

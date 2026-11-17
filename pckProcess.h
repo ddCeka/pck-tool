@@ -34,6 +34,7 @@ void PckBuildToFile(
     const PckBuildInput* files,
     u32 fileCount,
     const char* outputPath,
+    const char* embedExePath, // NULL for standalone .pck, or path to base executable
     PckEngineVersion engineVersion,
     u32 formatVersion
 );

@@ -3,8 +3,11 @@
 
 #include <stdlib.h>
 #include <string.h>
-#include <sys/types.h>
 #include <openssl/evp.h>
+
+#ifndef _WIN32
+#include <sys/stat.h>
+#endif
 
 #define GDPC_MAGIC IDENTIFIER_TO_U32('G', 'D', 'P', 'C')
 
@@ -22,7 +25,7 @@
 #define PCK_ALIGNMENT_V3 (32)
 #define AES_BLOCK_SIZE   (16)
 
-// Binary wire sizes (explicit constants avoid compiler padding ambiguity)
+// Binary wire sizes
 #define PCK_HEADER_PREFIX_SIZE   (20)
 #define PCK_HEADER_V1_SIZE       (84)
 #define PCK_HEADER_V2_SIZE       (96)
@@ -553,6 +556,7 @@ void PckListAll(const u8* pckData, u64 pckSize, const PckDecryptOptions* decrypt
     MD5Context md5Context = _PckCreateMD5Context();
     PckDirSession sess = _PckOpenDirSession(&view, decryptOpts, md5Context);
 
+    // Guard against bogus huge fileCount before allocating
     if ((u64)sess.fileCount * (sizeof(u32) + PCK_ENTRY_V1_SIZE) > (u64)(sess.dirEnd - sess.dirCursor))
         panic("PckListAll: Declared fileCount (%u) exceeds directory buffer size", sess.fileCount);
 
@@ -669,10 +673,93 @@ static u64 _PckGetFileSize(const char* path) {
     return (u64)sz;
 }
 
+static u64 _PckFindCleanExeSize(FILE* exeFp, u64 totalExeSize, bool* outHadExistingPck) {
+    if (outHadExistingPck) *outHadExistingPck = false;
+
+    if (totalExeSize < PCK_EMBED_FOOTER_SIZE + PCK_HEADER_PREFIX_SIZE + sizeof(u32))
+        return totalExeSize;
+
+    if (fseeko(exeFp, (off_t)(totalExeSize - PCK_EMBED_FOOTER_SIZE), SEEK_SET) != 0)
+        panic("PckBuildToFile: fseeko failed while inspecting base executable");
+
+    u8 footer[PCK_EMBED_FOOTER_SIZE];
+    if (fread(footer, 1, PCK_EMBED_FOOTER_SIZE, exeFp) != PCK_EMBED_FOOTER_SIZE)
+        panic("PckBuildToFile: fread failed on executable footer");
+
+    if (read_u32_le(footer + sizeof(u64)) != GDPC_MAGIC)
+        return totalExeSize;
+
+    u64 oldPckSize = read_u64_le(footer);
+    if (oldPckSize < PCK_HEADER_PREFIX_SIZE + sizeof(u32) ||
+        oldPckSize > totalExeSize - PCK_EMBED_FOOTER_SIZE) {
+        return totalExeSize;
+    }
+
+    u64 pckOffset = totalExeSize - PCK_EMBED_FOOTER_SIZE - oldPckSize;
+    if (fseeko(exeFp, (off_t)pckOffset, SEEK_SET) != 0)
+        panic("PckBuildToFile: fseeko failed while verifying embedded GDPC header");
+
+    u8 magicBuf[4];
+    if (fread(magicBuf, 1, 4, exeFp) != 4)
+        panic("PckBuildToFile: fread failed while verifying embedded GDPC header");
+
+    if (read_u32_le(magicBuf) == GDPC_MAGIC) {
+        if (outHadExistingPck) *outHadExistingPck = true;
+        return pckOffset;
+    }
+
+    return totalExeSize;
+}
+
+static void _PckCopyExeStub(const char* embedExePath, FILE* outFp, u8* streamBuf, u64* outStubSize, bool* outReplacedExisting) {
+    FILE* exeFp = fopen(embedExePath, "rb");
+    if (!exeFp)
+        panic("PckBuildToFile: unable to open base executable \"%s\"", embedExePath);
+
+    if (fseeko(exeFp, 0, SEEK_END) != 0) {
+        fclose(exeFp);
+        panic("PckBuildToFile: fseeko failed on \"%s\"", embedExePath);
+    }
+    off_t rawSize = ftello(exeFp);
+    if (rawSize <= 0) {
+        fclose(exeFp);
+        panic("PckBuildToFile: base executable \"%s\" is empty or invalid", embedExePath);
+    }
+
+    u64 stubSize = _PckFindCleanExeSize(exeFp, (u64)rawSize, outReplacedExisting);
+    if (fseeko(exeFp, 0, SEEK_SET) != 0) {
+        fclose(exeFp);
+        panic("PckBuildToFile: fseeko reset failed on \"%s\"", embedExePath);
+    }
+
+    u64 remaining = stubSize;
+    while (remaining > 0) {
+        size_t toRead = (remaining > PCK_STREAM_CHUNK_SIZE) ? PCK_STREAM_CHUNK_SIZE : (size_t)remaining;
+        size_t nRead = fread(streamBuf, 1, toRead, exeFp);
+        if (nRead != toRead) {
+            fclose(exeFp);
+            panic("PckBuildToFile: short read copying executable stub \"%s\"", embedExePath);
+        }
+        _PckWriteAll(outFp, streamBuf, nRead);
+        remaining -= nRead;
+    }
+
+#ifndef _WIN32
+    struct stat st;
+    if (fstat(fileno(exeFp), &st) == 0) {
+        fchmod(fileno(outFp), st.st_mode & 0777);
+    }
+#endif
+
+    fclose(exeFp);
+    *outStubSize = stubSize;
+}
+
 void PckBuildToFile(
     const PckBuildInput* files,
     u32 fileCount,
     const char* outputPath,
+    const char* embedExePath,
     PckEngineVersion engineVersion,
     u32 formatVersion
 ) {
@@ -706,36 +793,50 @@ void PckBuildToFile(
 
     u64 dataSectionOffset = 0;
     u64 dirSectionOffset  = 0;
-    u64 totalFileSize     = 0;
+    u64 totalPckSize      = 0;
 
     if (formatVersion <= PCK_VERSION_V2) {
         dirSectionOffset  = headerSize;
         dataSectionOffset = _PckAlignU64(dirSectionOffset + entrySectionSize, alignment);
-        totalFileSize     = dataSectionOffset + dataSectionSize;
+        totalPckSize      = dataSectionOffset + dataSectionSize;
     } else {
         dataSectionOffset = _PckAlignU64(headerSize, alignment);
         dirSectionOffset  = _PckAlignU64(dataSectionOffset + dataSectionSize, alignment);
-        totalFileSize     = dirSectionOffset + entrySectionSize;
+        totalPckSize      = dirSectionOffset + entrySectionSize;
+    }
+
+    u8* streamBuf = malloc(PCK_STREAM_CHUNK_SIZE);
+    if (!streamBuf) {
+        free(fileSizes);
+        panic("PckBuildToFile: malloc failed for stream buffer");
     }
 
     FILE* outFp = fopen(outputPath, "wb");
     if (!outFp) {
+        free(streamBuf);
         free(fileSizes);
         panic("PckBuildToFile: unable to create output file \"%s\"", outputPath);
     }
 
+    u64 baseOffset = 0;
+    bool replacedExisting = false;
+    if (embedExePath != NULL) {
+        _PckCopyExeStub(embedExePath, outFp, streamBuf, &baseOffset, &replacedExisting);
+    }
+
     char totalStr[24];
-    _PckFormatSize(totalFileSize, totalStr, sizeof(totalStr));
-    printf("Pack v%u (Godot %u.%u.%u) | %u files | %s\n",
+    _PckFormatSize(totalPckSize, totalStr, sizeof(totalStr));
+    printf("Pack v%u (Godot %u.%u.%u)%s | %u files | %s\n",
            formatVersion,
            engineVersion.majorVersion,
            engineVersion.minorVersion,
            engineVersion.patchVersion,
+           embedExePath ? (replacedExisting ? " [RE-EMB]" : " [EMB]") : "",
            fileCount,
            totalStr);
     _PckPrintRule();
 
-    // 1. Write PCK header
+    // 1. Write PCK header at baseOffset
     u8 hdr[PCK_HEADER_V2_SIZE] = { 0 };
     write_u32_le(hdr + 0,  GDPC_MAGIC);
     write_u32_le(hdr + 4,  formatVersion);
@@ -746,16 +847,20 @@ void PckBuildToFile(
     if (formatVersion >= PCK_VERSION_V2) {
         u32 flags  = (formatVersion >= PCK_VERSION_V3) ? PCK_FLAG_REL_FILEBASE : 0;
         u64 dirOff = (formatVersion >= PCK_VERSION_V3) ? dirSectionOffset : 0;
+        u64 hdrDataOff = (formatVersion >= PCK_VERSION_V3)
+            ? dataSectionOffset
+            : (baseOffset + dataSectionOffset);
         write_u32_le(hdr + 20, flags);
-        write_u64_le(hdr + 24, dataSectionOffset);
+        write_u64_le(hdr + 24, hdrDataOff);
         write_u64_le(hdr + 32, dirOff);
     }
     _PckWriteAll(outFp, hdr, headerSize);
 
-    // 2. Allocate directory buffer in memory (metadata only)
+    // 2. Allocate directory buffer in memory
     u8* dirBuf = calloc(1, (size_t)entrySectionSize);
     if (!dirBuf) {
         fclose(outFp);
+        free(streamBuf);
         free(fileSizes);
         panic("PckBuildToFile: calloc failed for directory");
     }
@@ -765,19 +870,12 @@ void PckBuildToFile(
     dirCursor += sizeof(u32);
 
     // Seek to start of data section (leaves zeroed space for V1/V2 directory)
-    if (fseeko(outFp, (off_t)dataSectionOffset, SEEK_SET) != 0) {
+    if (fseeko(outFp, (off_t)(baseOffset + dataSectionOffset), SEEK_SET) != 0) {
         free(dirBuf);
         fclose(outFp);
+        free(streamBuf);
         free(fileSizes);
         panic("PckBuildToFile: fseeko to data section failed");
-    }
-
-    u8* streamBuf = malloc(PCK_STREAM_CHUNK_SIZE);
-    if (!streamBuf) {
-        free(dirBuf);
-        fclose(outFp);
-        free(fileSizes);
-        panic("PckBuildToFile: malloc failed for stream buffer");
     }
 
     MD5Context md5Context = _PckCreateMD5Context();
@@ -829,7 +927,7 @@ void PckBuildToFile(
             panic("PckBuildToFile: EVP_DigestFinal_ex failed");
 
         u64 entryOffset = (formatVersion == PCK_VERSION_V1)
-            ? currentDataPos
+            ? (baseOffset + currentDataPos)
             : (currentDataPos - dataSectionOffset);
 
         write_u64_le(dirCursor + 0, entryOffset);
@@ -848,11 +946,21 @@ void PckBuildToFile(
         printf("  OK\n");
     }
 
-    // 4. Seek to dirSectionOffset and flush directory table
-    if (fseeko(outFp, (off_t)dirSectionOffset, SEEK_SET) != 0)
+    // 4. Write padding up to dirSectionOffset (for V3/V4) and flush directory table
+    if (fseeko(outFp, (off_t)(baseOffset + dirSectionOffset), SEEK_SET) != 0)
         panic("PckBuildToFile: fseeko to directory section failed");
 
     _PckWriteAll(outFp, dirBuf, (size_t)entrySectionSize);
+
+    // 5. Append 12-byte embedded PCK footer when bundling into an executable
+    if (embedExePath != NULL) {
+        if (fseeko(outFp, (off_t)(baseOffset + totalPckSize), SEEK_SET) != 0)
+            panic("PckBuildToFile: fseeko to embedded footer failed");
+        u8 footer[PCK_EMBED_FOOTER_SIZE];
+        write_u64_le(footer, totalPckSize);
+        write_u32_le(footer + sizeof(u64), GDPC_MAGIC);
+        _PckWriteAll(outFp, footer, PCK_EMBED_FOOTER_SIZE);
+    }
 
     _PckPrintRule();
     _PckEndMD5Context(md5Context);
