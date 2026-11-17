@@ -48,7 +48,7 @@ static void removeTree(const char* path) {
             while ((ent = readdir(dir)) != NULL) {
                 if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0)
                     continue;
-                char child[1024];
+                char child[PCK_MAX_PATH_LEN];
                 snprintf(child, sizeof(child), "%s/%s", path, ent->d_name);
                 removeTree(child);
             }
@@ -130,7 +130,7 @@ static char* runCmdCapture(const char* cmd, int* outExitCode) {
 }
 
 static void writeRandomAsset(const char* path, size_t size, unsigned seed) {
-    char dirCopy[1024];
+    char dirCopy[PCK_MAX_PATH_LEN];
     snprintf(dirCopy, sizeof(dirCopy), "%s", path);
     char* slash = strrchr(dirCopy, '/');
     if (slash) {
@@ -154,7 +154,7 @@ static void writeRandomAsset(const char* path, size_t size, unsigned seed) {
 }
 
 static void writeTextAsset(const char* path, const char* content) {
-    char dirCopy[1024];
+    char dirCopy[PCK_MAX_PATH_LEN];
     snprintf(dirCopy, sizeof(dirCopy), "%s", path);
     char* slash = strrchr(dirCopy, '/');
     if (slash) {
@@ -198,8 +198,7 @@ static u8* buildEncryptedStream(const u8* plain, size_t plainLen, const u8 key[3
     computeMD5(plain, plainLen, md5);
     memcpy(stream, md5, 16);
 
-    u64 len64 = (u64)plainLen;
-    memcpy(stream + 16, &len64, 8);
+    write_u64_le(stream + 16, (u64)plainLen);
 
     u8 iv[16] = { 0x10, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88,
                   0x99, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x01 };
@@ -241,8 +240,71 @@ static void test_hex_key_parser(void) {
     ASSERT(parseHexKey256(NULL, key) == false);
 }
 
+static void test_endian_and_path_sanitization(void) {
+    printf("Running test_endian_and_path_sanitization...\n");
+
+    u8 buf[8] = {0};
+    write_u32_le(buf, 0x12345678U);
+    ASSERT(buf[0] == 0x78 && buf[1] == 0x56 && buf[2] == 0x34 && buf[3] == 0x12);
+    ASSERT(read_u32_le(buf) == 0x12345678U);
+
+    write_u64_le(buf, 0x0102030405060708ULL);
+    ASSERT(buf[0] == 0x08 && buf[7] == 0x01);
+    ASSERT(read_u64_le(buf) == 0x0102030405060708ULL);
+
+    // Valid relative paths
+    ASSERT(sanitizeRelPath("project.godot", strlen("project.godot")) == true);
+    ASSERT(sanitizeRelPath("scripts/player.gd", strlen("scripts/player.gd")) == true);
+    ASSERT(sanitizeRelPath(".godot/imported/tex.ctex", strlen(".godot/imported/tex.ctex")) == true);
+    ASSERT(sanitizeRelPath("folder..name/file..txt", strlen("folder..name/file..txt")) == true);
+
+    // Unsafe / traversal paths
+    ASSERT(sanitizeRelPath("", 0) == false);
+    ASSERT(sanitizeRelPath(NULL, 5) == false);
+    ASSERT(sanitizeRelPath("../secret.txt", strlen("../secret.txt")) == false);
+    ASSERT(sanitizeRelPath("scripts/../../etc/passwd", strlen("scripts/../../etc/passwd")) == false);
+    ASSERT(sanitizeRelPath("scripts/..", strlen("scripts/..")) == false);
+    ASSERT(sanitizeRelPath("./project.godot", strlen("./project.godot")) == false);
+    ASSERT(sanitizeRelPath("/leading/slash.gd", strlen("/leading/slash.gd")) == false);
+    ASSERT(sanitizeRelPath("trailing/slash/", strlen("trailing/slash/")) == false);
+    ASSERT(sanitizeRelPath("double//slash.gd", strlen("double//slash.gd")) == false);
+    ASSERT(sanitizeRelPath("win\\backslash.gd", strlen("win\\backslash.gd")) == false);
+    ASSERT(sanitizeRelPath("C:drive.gd", strlen("C:drive.gd")) == false);
+
+    const char embeddedNull[] = "ok.gd\0evil.gd";
+    ASSERT(sanitizeRelPath(embeddedNull, sizeof(embeddedNull) - 1) == false);
+}
+
+static void test_mmap_file_handles(void) {
+    printf("Running test_mmap_file_handles...\n");
+
+    char workDir[512];
+    ASSERT(makeTempDir(workDir, sizeof(workDir)) != NULL);
+
+    char nonEmptyPath[600], emptyPath[600];
+    snprintf(nonEmptyPath, sizeof(nonEmptyPath), "%s/mapped.bin", workDir);
+    snprintf(emptyPath, sizeof(emptyPath), "%s/empty.bin", workDir);
+
+    writeRandomAsset(nonEmptyPath, 4096, 77);
+    writeRandomAsset(emptyPath, 0, 0);
+
+    FileHandle hNonEmpty = FileCreateHandle(nonEmptyPath);
+    ASSERT(hNonEmpty.size == 4096);
+    ASSERT(hNonEmpty.isMapped == true);
+    ASSERT(hNonEmpty.data_void != NULL);
+    FileDestroyHandle(hNonEmpty);
+
+    FileHandle hEmpty = FileCreateHandle(emptyPath);
+    ASSERT(hEmpty.size == 0);
+    ASSERT(hEmpty.isMapped == false);
+    ASSERT(hEmpty.data_void != NULL);
+    FileDestroyHandle(hEmpty);
+
+    removeTree(workDir);
+}
+
 static void test_cli_roundtrip_versions(void) {
-    printf("Running test_cli_roundtrip_versions (v1, v2, v3, v4)...\n");
+    printf("Running test_cli_roundtrip_versions (v1, v2, v3, v4 + multi-chunk streaming)...\n");
 
     char workDir[512];
     ASSERT(makeTempDir(workDir, sizeof(workDir)) != NULL);
@@ -251,16 +313,19 @@ static void test_cli_roundtrip_versions(void) {
     snprintf(srcDir, sizeof(srcDir), "%s/project", workDir);
     createDirectoryTree(srcDir);
 
-    char p1[700], p2[700], p3[700], p4[700];
+    char p1[700], p2[700], p3[700], p4[700], p5[700];
     snprintf(p1, sizeof(p1), "%s/project.godot", srcDir);
     snprintf(p2, sizeof(p2), "%s/scripts/controller.gd", srcDir);
     snprintf(p3, sizeof(p3), "%s/.godot/imported/noise_texture-94a1f.ctex", srcDir);
     snprintf(p4, sizeof(p4), "%s/empty_marker.import", srcDir);
+    // > 64KB chunk size (140 KB) to exercise multi-iteration streaming loop in PckBuildToFile
+    snprintf(p5, sizeof(p5), "%s/assets/large_stream_blob.bin", srcDir);
 
     writeTextAsset(p1, "; Engine configuration file.\nconfig_version=5\n\n[application]\nconfig/name=\"PcktTest\"\n");
     writeTextAsset(p2, "extends Node\n\nfunc _ready() -> void:\n\tprint(\"Hello Godot\")\n");
     writeRandomAsset(p3, 18432, 1337);
     writeRandomAsset(p4, 0, 0);
+    writeRandomAsset(p5, 143360, 2026);
 
     const char* flags[4] = { "--v1", "--v2", "--v3", "--v4" };
     for (int v = 0; v < 4; v++) {
@@ -274,16 +339,134 @@ static void test_cli_roundtrip_versions(void) {
         snprintf(cmd, sizeof(cmd), "./pckt unpack \"%s\" \"%s\" > /dev/null", pckPath, outDir);
         ASSERT_MSG(runCmd(cmd) == 0, "Unpack failed for %s", flags[v]);
 
-        char o1[700], o2[700], o3[700], o4[700];
+        char o1[700], o2[700], o3[700], o4[700], o5[700];
         snprintf(o1, sizeof(o1), "%s/project.godot", outDir);
         snprintf(o2, sizeof(o2), "%s/scripts/controller.gd", outDir);
         snprintf(o3, sizeof(o3), "%s/.godot/imported/noise_texture-94a1f.ctex", outDir);
         snprintf(o4, sizeof(o4), "%s/empty_marker.import", outDir);
+        snprintf(o5, sizeof(o5), "%s/assets/large_stream_blob.bin", outDir);
 
         ASSERT(filesIdentical(p1, o1));
         ASSERT(filesIdentical(p2, o2));
         ASSERT(filesIdentical(p3, o3));
         ASSERT(filesIdentical(p4, o4));
+        ASSERT(filesIdentical(p5, o5));
+    }
+
+    removeTree(workDir);
+}
+
+static void test_cli_security_and_removal_flags(void) {
+    printf("Running test_cli_security_and_removal_flags (Zip Slip & DEL entries)...\n");
+
+    char workDir[512];
+    ASSERT(makeTempDir(workDir, sizeof(workDir)) != NULL);
+
+    // 1. Craft a malicious PCK v3 containing a Zip Slip path: "res://../escaped.txt"
+    {
+        const char* badUri = "res://../escaped.txt";
+        const char* payload = "PWNED";
+        u32 rawNameLen = (u32)strlen(badUri);
+        u32 paddedNameLen = (rawNameLen + 3) & ~3u;
+
+        u8 md5[16];
+        computeMD5(payload, strlen(payload), md5);
+
+        u64 dataSectionOffset = 96;
+        u64 dirOffset = 128; // 32-byte aligned
+        size_t dirSize = 4 + 4 + paddedNameLen + 36;
+        size_t totalSize = (size_t)dirOffset + dirSize;
+        u8* pck = calloc(1, totalSize);
+
+        write_u32_le(pck + 0, IDENTIFIER_TO_U32('G', 'D', 'P', 'C'));
+        write_u32_le(pck + 4, 3);
+        write_u32_le(pck + 8, 4);
+        write_u32_le(pck + 12, 6);
+        write_u32_le(pck + 16, 0);
+        write_u32_le(pck + 20, (1 << 1)); // PCK_FLAG_REL_FILEBASE
+        write_u64_le(pck + 24, dataSectionOffset);
+        write_u64_le(pck + 32, dirOffset);
+
+        memcpy(pck + dataSectionOffset, payload, strlen(payload));
+
+        u8* d = pck + dirOffset;
+        write_u32_le(d, 1);
+        d += 4;
+        write_u32_le(d, paddedNameLen);
+        memcpy(d + 4, badUri, rawNameLen);
+        d += 4 + paddedNameLen;
+        write_u64_le(d + 0, 0);
+        write_u64_le(d + 8, strlen(payload));
+        memcpy(d + 16, md5, 16);
+        write_u32_le(d + 32, 0);
+
+        char malPck[600], outDir[600], escapedFile[600], cmd[2048];
+        snprintf(malPck, sizeof(malPck), "%s/zipslip.pck", workDir);
+        snprintf(outDir, sizeof(outDir), "%s/nested/out", workDir);
+        snprintf(escapedFile, sizeof(escapedFile), "%s/nested/escaped.txt", workDir);
+
+        FILE* fp = fopen(malPck, "wb");
+        fwrite(pck, 1, totalSize, fp);
+        fclose(fp);
+        free(pck);
+
+        snprintf(cmd, sizeof(cmd), "./pckt unpack \"%s\" \"%s\" > /dev/null 2>&1", malPck, outDir);
+        ASSERT_MSG(runCmd(cmd) != 0, "Unpacker must reject path traversal entries");
+
+        struct stat st;
+        ASSERT_MSG(stat(escapedFile, &st) != 0, "Traversal target file must not be created");
+    }
+
+    // 2. Craft a patch PCK v3 with a PCK_FILE_FLAG_REMOVAL (DEL) entry
+    {
+        const char* delUri = "res://obsolete_level.tscn";
+        u32 rawNameLen = (u32)strlen(delUri);
+        u32 paddedNameLen = (rawNameLen + 3) & ~3u;
+
+        u8 emptyMd5[16];
+        computeMD5("", 0, emptyMd5);
+
+        u64 dataSectionOffset = 96;
+        u64 dirOffset = 96;
+        size_t dirSize = 4 + 4 + paddedNameLen + 36;
+        size_t totalSize = (size_t)dirOffset + dirSize;
+        u8* pck = calloc(1, totalSize);
+
+        write_u32_le(pck + 0, IDENTIFIER_TO_U32('G', 'D', 'P', 'C'));
+        write_u32_le(pck + 4, 3);
+        write_u32_le(pck + 8, 4);
+        write_u32_le(pck + 12, 6);
+        write_u32_le(pck + 16, 0);
+        write_u32_le(pck + 20, (1 << 1));
+        write_u64_le(pck + 24, dataSectionOffset);
+        write_u64_le(pck + 32, dirOffset);
+
+        u8* d = pck + dirOffset;
+        write_u32_le(d, 1);
+        d += 4;
+        write_u32_le(d, paddedNameLen);
+        memcpy(d + 4, delUri, rawNameLen);
+        d += 4 + paddedNameLen;
+        write_u64_le(d + 0, 0);
+        write_u64_le(d + 8, 0);
+        memcpy(d + 16, emptyMd5, 16);
+        write_u32_le(d + 32, (1 << 1)); // PCK_FILE_FLAG_REMOVAL
+
+        char delPck[600], outDir[600], skippedFile[600], cmd[2048];
+        snprintf(delPck, sizeof(delPck), "%s/patch_del.pck", workDir);
+        snprintf(outDir, sizeof(outDir), "%s/patch_out", workDir);
+        snprintf(skippedFile, sizeof(skippedFile), "%s/obsolete_level.tscn", outDir);
+
+        FILE* fp = fopen(delPck, "wb");
+        fwrite(pck, 1, totalSize, fp);
+        fclose(fp);
+        free(pck);
+
+        snprintf(cmd, sizeof(cmd), "./pckt unpack \"%s\" \"%s\" > /dev/null", delPck, outDir);
+        ASSERT_MSG(runCmd(cmd) == 0, "Unpack should succeed on PCK with removal entry");
+
+        struct stat st;
+        ASSERT_MSG(stat(skippedFile, &st) != 0, "Removal-flagged entry must not be written to disk");
     }
 
     removeTree(workDir);
@@ -315,17 +498,14 @@ static void test_cli_encrypted_pck(void) {
     size_t plainDirLen = 4 + paddedNameLen + 8 + 8 + 16 + 4;
     u8* plainDir = calloc(1, plainDirLen);
 
-    memcpy(plainDir, &paddedNameLen, 4);
+    write_u32_le(plainDir, paddedNameLen);
     memcpy(plainDir + 4, resPath, rawNameLen);
 
     u8* entryPtr = plainDir + 4 + paddedNameLen;
-    u64 dataOffset = 0;
-    u64 dataSize = (u64)plainLen;
-    u32 entryFlags = (1 << 0); // PCK_FILE_FLAG_ENCRYPTED
-    memcpy(entryPtr + 0, &dataOffset, 8);
-    memcpy(entryPtr + 8, &dataSize, 8);
+    write_u64_le(entryPtr + 0, 0);
+    write_u64_le(entryPtr + 8, (u64)plainLen);
     memcpy(entryPtr + 16, plainMd5, 16);
-    memcpy(entryPtr + 32, &entryFlags, 4);
+    write_u32_le(entryPtr + 32, (1 << 0)); // PCK_FILE_FLAG_ENCRYPTED
 
     size_t encDirLen = 0;
     u8* encDirStream = buildEncryptedStream(plainDir, plainDirLen, key, &encDirLen);
@@ -336,22 +516,18 @@ static void test_cli_encrypted_pck(void) {
     size_t totalPckSize = (size_t)dirOffset + 4 + encDirLen;
     u8* pck = calloc(1, totalPckSize);
 
-    u32 magic = IDENTIFIER_TO_U32('G', 'D', 'P', 'C');
-    u32 fmtVer = 3;
-    u32 engVer[3] = { 4, 6, 0 };
-    u32 hdrFlags = (1 << 0) | (1 << 1); // PCK_FLAG_DIR_ENCRYPTED | PCK_FLAG_REL_FILEBASE
-
-    memcpy(pck + 0, &magic, 4);
-    memcpy(pck + 4, &fmtVer, 4);
-    memcpy(pck + 8, engVer, 12);
-    memcpy(pck + 20, &hdrFlags, 4);
-    memcpy(pck + 24, &dataSectionOffset, 8);
-    memcpy(pck + 32, &dirOffset, 8);
+    write_u32_le(pck + 0, IDENTIFIER_TO_U32('G', 'D', 'P', 'C'));
+    write_u32_le(pck + 4, 3);
+    write_u32_le(pck + 8, 4);
+    write_u32_le(pck + 12, 6);
+    write_u32_le(pck + 16, 0);
+    write_u32_le(pck + 20, (1 << 0) | (1 << 1)); // PCK_FLAG_DIR_ENCRYPTED | PCK_FLAG_REL_FILEBASE
+    write_u64_le(pck + 24, dataSectionOffset);
+    write_u64_le(pck + 32, dirOffset);
 
     memcpy(pck + dataSectionOffset, encFileStream, encFileLen);
 
-    u32 fileCount = 1;
-    memcpy(pck + dirOffset, &fileCount, 4);
+    write_u32_le(pck + dirOffset, 1);
     memcpy(pck + dirOffset + 4, encDirStream, encDirLen);
 
     char pckPath[600], keyFilePath[600], outDir1[600], outDir2[600], cmd[2048];
@@ -427,10 +603,10 @@ static void test_cli_embedded_exe_unpack(void) {
     fwrite(stub, 1, stubSize, exeFp);
     fwrite(pckHndl.data_void, 1, pckHndl.size, exeFp);
 
-    u64 embeddedSize = pckHndl.size;
-    u32 footerMagic = IDENTIFIER_TO_U32('G', 'D', 'P', 'C');
-    fwrite(&embeddedSize, 1, 8, exeFp);
-    fwrite(&footerMagic, 1, 4, exeFp);
+    u8 footer[12];
+    write_u64_le(footer + 0, pckHndl.size);
+    write_u32_le(footer + 8, IDENTIFIER_TO_U32('G', 'D', 'P', 'C'));
+    fwrite(footer, 1, sizeof(footer), exeFp);
     fclose(exeFp);
 
     free(stub);
@@ -508,7 +684,10 @@ static void test_cli_list_mode(void) {
 
 int main(void) {
     test_hex_key_parser();
+    test_endian_and_path_sanitization();
+    test_mmap_file_handles();
     test_cli_roundtrip_versions();
+    test_cli_security_and_removal_flags();
     test_cli_encrypted_pck();
     test_cli_embedded_exe_unpack();
     test_cli_list_mode();
