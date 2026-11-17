@@ -10,7 +10,7 @@
 #define PCK_VERSION_V4 (4)
 #define PCK_VERSION_LATEST PCK_VERSION_V3
 
-typedef struct __attribute__((packed)) {
+typedef struct {
     u32 majorVersion;
     u32 minorVersion;
     u32 patchVersion;
@@ -21,15 +21,21 @@ typedef struct {
     u8 key[32];
 } PckDecryptOptions;
 
-void PckPreprocess(u8* pckData, u64 pckSize, const PckDecryptOptions* decryptOpts);
-void PckExtractAll(u8* pckData, u64 pckSize, const char* outputDirectory, const PckDecryptOptions* decryptOpts);
-void PckListAll(u8* pckData, u64 pckSize, const PckDecryptOptions* decryptOpts);
+void PckPreprocess(const u8* pckData, u64 pckSize, const PckDecryptOptions* decryptOpts);
+void PckExtractAll(const u8* pckData, u64 pckSize, const char* outputDirectory, const PckDecryptOptions* decryptOpts);
+void PckListAll(const u8* pckData, u64 pckSize, const PckDecryptOptions* decryptOpts);
 
 typedef struct {
-    char* filename; // Not including root directory
-    FileHandle hndl;
-} PckBuildFile;
+    char* diskPath;    // Full path on local filesystem
+    char* archivePath; // Relative path inside archive (without root directory)
+} PckBuildInput;
 
-FileHandle PckBuild(PckBuildFile* files, u32 fileCount, PckEngineVersion engineVersion, u32 formatVersion);
+void PckBuildToFile(
+    const PckBuildInput* files,
+    u32 fileCount,
+    const char* outputPath,
+    PckEngineVersion engineVersion,
+    u32 formatVersion
+);
 
 #endif // PCKPROCESS_H

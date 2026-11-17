@@ -91,13 +91,13 @@ int main(int argc, char** argv) {
     } else if (strcasecmp(mode, "pack") == 0) {
         GetAllFilesResult r = getAllFiles(inputPath);
 
-        PckBuildFile* buildFiles = malloc(sizeof(PckBuildFile) * r.fileCount);
-        for (unsigned i = 0; i < r.fileCount; i++) {
-            buildFiles[i].hndl = FileCreateHandle(r.fullFilenames[i]);
-            buildFiles[i].filename = strdup(r.truncatedFilenames[i]);
+        PckBuildInput* buildFiles = malloc(sizeof(PckBuildInput) * (r.fileCount > 0 ? r.fileCount : 1));
+        if (!buildFiles)
+            panic("main: malloc failed");
 
-            free(r.fullFilenames[i]);
-            free(r.truncatedFilenames[i]);
+        for (unsigned i = 0; i < r.fileCount; i++) {
+            buildFiles[i].diskPath = r.fullFilenames[i];
+            buildFiles[i].archivePath = r.truncatedFilenames[i];
         }
         free(r.fullFilenames);
         free(r.truncatedFilenames);
@@ -108,14 +108,11 @@ int main(int argc, char** argv) {
             .patchVersion = 0
         };
 
-        FileHandle hndl = PckBuild(buildFiles, r.fileCount, engineVersion, targetFormatVersion);
-        FileWriteHandle(hndl, outputPath);
-
-        free(hndl.data_void);
+        PckBuildToFile(buildFiles, r.fileCount, outputPath, engineVersion, targetFormatVersion);
 
         for (unsigned i = 0; i < r.fileCount; i++) {
-            free(buildFiles[i].hndl.data_void);
-            free(buildFiles[i].filename);
+            free(buildFiles[i].diskPath);
+            free(buildFiles[i].archivePath);
         }
         free(buildFiles);
         printf("Done -> %s\n", outputPath);

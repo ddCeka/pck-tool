@@ -10,6 +10,7 @@ typedef struct {
         void* data_void;
     };
     u64 size;
+    bool isMapped;
 } FileHandle;
 
 FileHandle FileCreateHandle(const char* path);

@@ -3,6 +3,7 @@
 
 #include <stdlib.h>
 #include <string.h>
+#include <sys/types.h>
 #include <openssl/evp.h>
 
 #define GDPC_MAGIC IDENTIFIER_TO_U32('G', 'D', 'P', 'C')
@@ -29,6 +30,8 @@
 #define PCK_ENTRY_V2_SIZE        (36)
 #define PCK_ENC_HEADER_SIZE      (40)
 #define PCK_EMBED_FOOTER_SIZE    (12)
+
+#define PCK_STREAM_CHUNK_SIZE    (65536)
 
 // Folder name used on disk when unpacking user:// entries
 #define USER_SCHEME_DIR "__user__"
@@ -225,7 +228,7 @@ static u8* _PckDecryptStream(
     return decryptedBuf;
 }
 
-void PckPreprocess(u8* pckData, u64 pckSize, const PckDecryptOptions* decryptOpts) {
+void PckPreprocess(const u8* pckData, u64 pckSize, const PckDecryptOptions* decryptOpts) {
     PckResolvedView view = _PckResolveView(pckData, pckSize);
     u32 formatVersion = read_u32_le(view.pckStart + 4);
 
@@ -394,7 +397,7 @@ static bool _PckReadNextEntry(PckDirSession* sess, u32 idx, PckParsedEntry* outE
     return true;
 }
 
-void PckExtractAll(u8* pckData, u64 pckSize, const char* outputDirectory, const PckDecryptOptions* decryptOpts) {
+void PckExtractAll(const u8* pckData, u64 pckSize, const char* outputDirectory, const PckDecryptOptions* decryptOpts) {
     PckResolvedView view = _PckResolveView(pckData, pckSize);
     MD5Context md5Context = _PckCreateMD5Context();
     PckDirSession sess = _PckOpenDirSession(&view, decryptOpts, md5Context);
@@ -433,7 +436,7 @@ void PckExtractAll(u8* pckData, u64 pckSize, const char* outputDirectory, const 
         if (entry.dataOffset > sess.maxDataSpan)
             panic("PckExtractAll: Entry \"%.*s\" offset out of bounds", (int)entry.nameLen, entry.namePtr);
 
-        FileHandle hndl;
+        FileHandle hndl = { 0 };
         u8* decryptedFileBuf = NULL;
 
         if (isFileEncrypted) {
@@ -545,12 +548,11 @@ static int _CompareListEntriesDesc(const void* a, const void* b) {
     return strcmp(ea->name, eb->name);
 }
 
-void PckListAll(u8* pckData, u64 pckSize, const PckDecryptOptions* decryptOpts) {
+void PckListAll(const u8* pckData, u64 pckSize, const PckDecryptOptions* decryptOpts) {
     PckResolvedView view = _PckResolveView(pckData, pckSize);
     MD5Context md5Context = _PckCreateMD5Context();
     PckDirSession sess = _PckOpenDirSession(&view, decryptOpts, md5Context);
 
-    // Guard against bogus huge fileCount before allocating
     if ((u64)sess.fileCount * (sizeof(u32) + PCK_ENTRY_V1_SIZE) > (u64)(sess.dirEnd - sess.dirCursor))
         panic("PckListAll: Declared fileCount (%u) exceeds directory buffer size", sess.fileCount);
 
@@ -638,31 +640,68 @@ static size_t _PckFormatGodotUri(const char* localRelPath, char* outBuf, size_t 
     return (size_t)written;
 }
 
-FileHandle PckBuild(PckBuildFile* files, u32 fileCount, PckEngineVersion engineVersion, u32 formatVersion) {
+static void _PckWriteAll(FILE* fp, const void* buf, size_t len) {
+    if (len > 0 && fwrite(buf, 1, len, fp) != len)
+        panic("PckBuildToFile: fwrite failed");
+}
+
+static void _PckWriteZeros(FILE* fp, u64 count) {
+    static const u8 zeroBuf[4096] = { 0 };
+    while (count > 0) {
+        size_t chunk = (count > sizeof(zeroBuf)) ? sizeof(zeroBuf) : (size_t)count;
+        _PckWriteAll(fp, zeroBuf, chunk);
+        count -= chunk;
+    }
+}
+
+static u64 _PckGetFileSize(const char* path) {
+    FILE* f = fopen(path, "rb");
+    if (!f)
+        panic("PckBuildToFile: unable to open \"%s\"", path);
+    if (fseeko(f, 0, SEEK_END) != 0) {
+        fclose(f);
+        panic("PckBuildToFile: fseeko failed on \"%s\"", path);
+    }
+    off_t sz = ftello(f);
+    fclose(f);
+    if (sz < 0)
+        panic("PckBuildToFile: ftello failed on \"%s\"", path);
+    return (u64)sz;
+}
+
+void PckBuildToFile(
+    const PckBuildInput* files,
+    u32 fileCount,
+    const char* outputPath,
+    PckEngineVersion engineVersion,
+    u32 formatVersion
+) {
     if (formatVersion != PCK_VERSION_V1 &&
         formatVersion != PCK_VERSION_V2 &&
         formatVersion != PCK_VERSION_V3 &&
         formatVersion != PCK_VERSION_V4) {
-        panic("PckBuild: Unsupported target format version %u", formatVersion);
+        panic("PckBuildToFile: Unsupported target format version %u", formatVersion);
     }
 
-    FileHandle resultHndl;
     const u64 alignment = (formatVersion == PCK_VERSION_V1) ? PCK_ALIGNMENT_V1 :
                           (formatVersion >= PCK_VERSION_V3) ? PCK_ALIGNMENT_V3 : PCK_ALIGNMENT_V2;
     const size_t headerSize = (formatVersion == PCK_VERSION_V1) ? PCK_HEADER_V1_SIZE : PCK_HEADER_V2_SIZE;
     const size_t entrySize  = (formatVersion == PCK_VERSION_V1) ? PCK_ENTRY_V1_SIZE  : PCK_ENTRY_V2_SIZE;
 
+    u64* fileSizes = calloc(fileCount > 0 ? fileCount : 1, sizeof(u64));
+    if (!fileSizes)
+        panic("PckBuildToFile: calloc failed");
+
     char uriBuf[PCK_MAX_PATH_LEN];
     u64 entrySectionSize = sizeof(u32);
-    for (u32 i = 0; i < fileCount; i++) {
-        size_t rawNameLen = _PckFormatGodotUri(files[i].filename, uriBuf, sizeof(uriBuf));
-        entrySectionSize += sizeof(u32) + _PckAlignU64(rawNameLen, PCK_ALIGNMENT_V2);
-        entrySectionSize += entrySize;
-    }
+    u64 dataSectionSize  = 0;
 
-    u64 dataSectionSize = 0;
     for (u32 i = 0; i < fileCount; i++) {
-        dataSectionSize += _PckAlignU64(files[i].hndl.size, alignment);
+        size_t rawNameLen = _PckFormatGodotUri(files[i].archivePath, uriBuf, sizeof(uriBuf));
+        entrySectionSize += sizeof(u32) + _PckAlignU64(rawNameLen, PCK_ALIGNMENT_V2) + entrySize;
+
+        fileSizes[i] = _PckGetFileSize(files[i].diskPath);
+        dataSectionSize += _PckAlignU64(fileSizes[i], alignment);
     }
 
     u64 dataSectionOffset = 0;
@@ -679,11 +718,11 @@ FileHandle PckBuild(PckBuildFile* files, u32 fileCount, PckEngineVersion engineV
         totalFileSize     = dirSectionOffset + entrySectionSize;
     }
 
-    resultHndl.data_void = calloc(1, totalFileSize);
-    if (!resultHndl.data_void)
-        panic("PckBuild: calloc failed");
-
-    resultHndl.size = totalFileSize;
+    FILE* outFp = fopen(outputPath, "wb");
+    if (!outFp) {
+        free(fileSizes);
+        panic("PckBuildToFile: unable to create output file \"%s\"", outputPath);
+    }
 
     char totalStr[24];
     _PckFormatSize(totalFileSize, totalStr, sizeof(totalStr));
@@ -696,7 +735,8 @@ FileHandle PckBuild(PckBuildFile* files, u32 fileCount, PckEngineVersion engineV
            totalStr);
     _PckPrintRule();
 
-    u8* hdr = resultHndl.data_u8;
+    // 1. Write PCK header
+    u8 hdr[PCK_HEADER_V2_SIZE] = { 0 };
     write_u32_le(hdr + 0,  GDPC_MAGIC);
     write_u32_le(hdr + 4,  formatVersion);
     write_u32_le(hdr + 8,  engineVersion.majorVersion);
@@ -704,59 +744,122 @@ FileHandle PckBuild(PckBuildFile* files, u32 fileCount, PckEngineVersion engineV
     write_u32_le(hdr + 16, engineVersion.patchVersion);
 
     if (formatVersion >= PCK_VERSION_V2) {
-        u32 flags = (formatVersion >= PCK_VERSION_V3) ? PCK_FLAG_REL_FILEBASE : 0;
+        u32 flags  = (formatVersion >= PCK_VERSION_V3) ? PCK_FLAG_REL_FILEBASE : 0;
         u64 dirOff = (formatVersion >= PCK_VERSION_V3) ? dirSectionOffset : 0;
         write_u32_le(hdr + 20, flags);
         write_u64_le(hdr + 24, dataSectionOffset);
         write_u64_le(hdr + 32, dirOff);
     }
+    _PckWriteAll(outFp, hdr, headerSize);
 
-    u8* const dataSectionStart = resultHndl.data_u8 + dataSectionOffset;
-    u8* nextData = dataSectionStart;
+    // 2. Allocate directory buffer in memory (metadata only)
+    u8* dirBuf = calloc(1, (size_t)entrySectionSize);
+    if (!dirBuf) {
+        fclose(outFp);
+        free(fileSizes);
+        panic("PckBuildToFile: calloc failed for directory");
+    }
 
-    u8* dirCursor = resultHndl.data_u8 + dirSectionOffset;
+    u8* dirCursor = dirBuf;
     write_u32_le(dirCursor, fileCount);
     dirCursor += sizeof(u32);
 
+    // Seek to start of data section (leaves zeroed space for V1/V2 directory)
+    if (fseeko(outFp, (off_t)dataSectionOffset, SEEK_SET) != 0) {
+        free(dirBuf);
+        fclose(outFp);
+        free(fileSizes);
+        panic("PckBuildToFile: fseeko to data section failed");
+    }
+
+    u8* streamBuf = malloc(PCK_STREAM_CHUNK_SIZE);
+    if (!streamBuf) {
+        free(dirBuf);
+        fclose(outFp);
+        free(fileSizes);
+        panic("PckBuildToFile: malloc failed for stream buffer");
+    }
+
     MD5Context md5Context = _PckCreateMD5Context();
+    u64 currentDataPos = dataSectionOffset;
 
+    // 3. Stream each asset in 64 KB chunks while hashing and recording directory entries
     for (u32 i = 0; i < fileCount; i++) {
-        PckBuildFile* file = files + i;
-
-        size_t rawNameLen = _PckFormatGodotUri(file->filename, uriBuf, sizeof(uriBuf));
+        size_t rawNameLen = _PckFormatGodotUri(files[i].archivePath, uriBuf, sizeof(uriBuf));
         u64 paddedNameLen = _PckAlignU64(rawNameLen, PCK_ALIGNMENT_V2);
 
         char sizeStr[16];
         char shortName[48];
-        _PckFormatSize(file->hndl.size, sizeStr, sizeof(sizeStr));
+        _PckFormatSize(fileSizes[i], sizeStr, sizeof(sizeStr));
         _PckTruncatePath(uriBuf, rawNameLen, shortName, 44);
-        printf("  %-44s %9s  OK\n", shortName, sizeStr);
+        printf("  %-44s %9s", shortName, sizeStr);
+        fflush(stdout);
 
         write_u32_le(dirCursor, (u32)paddedNameLen);
         memcpy(dirCursor + sizeof(u32), uriBuf, rawNameLen);
         dirCursor += sizeof(u32) + paddedNameLen;
 
+        if (EVP_DigestInit_ex(md5Context, EVP_md5(), NULL) != 1)
+            panic("PckBuildToFile: EVP_DigestInit_ex failed");
+
+        FILE* inFp = fopen(files[i].diskPath, "rb");
+        if (!inFp)
+            panic("PckBuildToFile: failed to open \"%s\"", files[i].diskPath);
+
+        u64 remaining = fileSizes[i];
+        while (remaining > 0) {
+            size_t toRead = (remaining > PCK_STREAM_CHUNK_SIZE) ? PCK_STREAM_CHUNK_SIZE : (size_t)remaining;
+            size_t nRead = fread(streamBuf, 1, toRead, inFp);
+            if (nRead != toRead) {
+                fclose(inFp);
+                panic("PckBuildToFile: short read on \"%s\"", files[i].diskPath);
+            }
+            if (EVP_DigestUpdate(md5Context, streamBuf, nRead) != 1) {
+                fclose(inFp);
+                panic("PckBuildToFile: EVP_DigestUpdate failed");
+            }
+            _PckWriteAll(outFp, streamBuf, nRead);
+            remaining -= nRead;
+        }
+        fclose(inFp);
+
         unsigned char md5[16];
-        _PckProduceMD5(file->hndl.data_void, file->hndl.size, md5Context, md5);
+        unsigned mdl = 0;
+        if (EVP_DigestFinal_ex(md5Context, md5, &mdl) != 1 || mdl != 16)
+            panic("PckBuildToFile: EVP_DigestFinal_ex failed");
 
-        u64 writtenOffset = (formatVersion == PCK_VERSION_V1)
-            ? (u64)(nextData - resultHndl.data_u8)
-            : (u64)(nextData - dataSectionStart);
+        u64 entryOffset = (formatVersion == PCK_VERSION_V1)
+            ? currentDataPos
+            : (currentDataPos - dataSectionOffset);
 
-        write_u64_le(dirCursor + 0, writtenOffset);
-        write_u64_le(dirCursor + 8, file->hndl.size);
+        write_u64_le(dirCursor + 0, entryOffset);
+        write_u64_le(dirCursor + 8, fileSizes[i]);
         memcpy(dirCursor + 16, md5, 16);
         if (formatVersion >= PCK_VERSION_V2)
             write_u32_le(dirCursor + 32, 0);
-
         dirCursor += entrySize;
 
-        if (file->hndl.size > 0)
-            memcpy(nextData, file->hndl.data_void, file->hndl.size);
-        nextData += _PckAlignU64(file->hndl.size, alignment);
+        u64 alignedLen = _PckAlignU64(fileSizes[i], alignment);
+        u64 padBytes = alignedLen - fileSizes[i];
+        if (padBytes > 0)
+            _PckWriteZeros(outFp, padBytes);
+
+        currentDataPos += alignedLen;
+        printf("  OK\n");
     }
+
+    // 4. Seek to dirSectionOffset and flush directory table
+    if (fseeko(outFp, (off_t)dirSectionOffset, SEEK_SET) != 0)
+        panic("PckBuildToFile: fseeko to directory section failed");
+
+    _PckWriteAll(outFp, dirBuf, (size_t)entrySectionSize);
 
     _PckPrintRule();
     _PckEndMD5Context(md5Context);
-    return resultHndl;
+    free(streamBuf);
+    free(dirBuf);
+    free(fileSizes);
+
+    if (fclose(outFp) != 0)
+        panic("PckBuildToFile: fclose failed on \"%s\"", outputPath);
 }
