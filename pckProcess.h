@@ -17,11 +17,17 @@ typedef struct {
 } PckEngineVersion;
 
 typedef struct {
+    u32 formatVersion;
+    PckEngineVersion engineVersion;
+} PckMetadata;
+
+typedef struct {
     bool hasKey;
     u8 key[32];
 } PckDecryptOptions;
 
 void PckPreprocess(const u8* pckData, u64 pckSize, const PckDecryptOptions* decryptOpts);
+PckMetadata PckReadMetadata(const u8* pckData, u64 pckSize);
 void PckExtractAll(const u8* pckData, u64 pckSize, const char* outputDirectory, const PckDecryptOptions* decryptOpts);
 void PckListAll(const u8* pckData, u64 pckSize, const PckDecryptOptions* decryptOpts);
 

@@ -25,7 +25,7 @@
 #define PCK_ALIGNMENT_V3 (32)
 #define AES_BLOCK_SIZE   (16)
 
-// Binary wire sizes
+// Binary wire sizes (explicit constants avoid compiler padding ambiguity)
 #define PCK_HEADER_PREFIX_SIZE   (20)
 #define PCK_HEADER_V1_SIZE       (84)
 #define PCK_HEADER_V2_SIZE       (96)
@@ -229,6 +229,24 @@ static u8* _PckDecryptStream(
 
     if (outPlaintextSize) *outPlaintextSize = plainLen;
     return decryptedBuf;
+}
+
+PckMetadata PckReadMetadata(const u8* pckData, u64 pckSize) {
+    PckResolvedView view = _PckResolveView(pckData, pckSize);
+    PckMetadata meta = { 0 };
+    meta.formatVersion = read_u32_le(view.pckStart + 4);
+
+    if (meta.formatVersion != PCK_VERSION_V1 &&
+        meta.formatVersion != PCK_VERSION_V2 &&
+        meta.formatVersion != PCK_VERSION_V3 &&
+        meta.formatVersion != PCK_VERSION_V4) {
+        panic("PckReadMetadata: Unsupported PCK format version %u (expected 1..4)", meta.formatVersion);
+    }
+
+    meta.engineVersion.majorVersion = read_u32_le(view.pckStart + 8);
+    meta.engineVersion.minorVersion = read_u32_le(view.pckStart + 12);
+    meta.engineVersion.patchVersion = read_u32_le(view.pckStart + 16);
+    return meta;
 }
 
 void PckPreprocess(const u8* pckData, u64 pckSize, const PckDecryptOptions* decryptOpts) {
@@ -556,7 +574,6 @@ void PckListAll(const u8* pckData, u64 pckSize, const PckDecryptOptions* decrypt
     MD5Context md5Context = _PckCreateMD5Context();
     PckDirSession sess = _PckOpenDirSession(&view, decryptOpts, md5Context);
 
-    // Guard against bogus huge fileCount before allocating
     if ((u64)sess.fileCount * (sizeof(u32) + PCK_ENTRY_V1_SIZE) > (u64)(sess.dirEnd - sess.dirCursor))
         panic("PckListAll: Declared fileCount (%u) exceeds directory buffer size", sess.fileCount);
 
@@ -711,7 +728,13 @@ static u64 _PckFindCleanExeSize(FILE* exeFp, u64 totalExeSize, bool* outHadExist
     return totalExeSize;
 }
 
-static void _PckCopyExeStub(const char* embedExePath, FILE* outFp, u8* streamBuf, u64* outStubSize, bool* outReplacedExisting) {
+static void _PckCopyExeStub(
+    const char* embedExePath,
+    FILE* outFp,
+    u8* streamBuf,
+    u64* outStubSize,
+    bool* outReplacedExisting
+) {
     FILE* exeFp = fopen(embedExePath, "rb");
     if (!exeFp)
         panic("PckBuildToFile: unable to open base executable \"%s\"", embedExePath);
@@ -946,16 +969,17 @@ void PckBuildToFile(
         printf("  OK\n");
     }
 
-    // 4. Write padding up to dirSectionOffset (for V3/V4) and flush directory table
+    // 4. Seek to dirSectionOffset and flush directory table
     if (fseeko(outFp, (off_t)(baseOffset + dirSectionOffset), SEEK_SET) != 0)
         panic("PckBuildToFile: fseeko to directory section failed");
 
     _PckWriteAll(outFp, dirBuf, (size_t)entrySectionSize);
 
-    // 5. Append 12-byte embedded PCK footer when bundling into an executable
+    // 5. If embedding into an executable, write the 12-byte footer at the end
     if (embedExePath != NULL) {
         if (fseeko(outFp, (off_t)(baseOffset + totalPckSize), SEEK_SET) != 0)
             panic("PckBuildToFile: fseeko to embedded footer failed");
+
         u8 footer[PCK_EMBED_FOOTER_SIZE];
         write_u64_le(footer, totalPckSize);
         write_u32_le(footer + sizeof(u64), GDPC_MAGIC);

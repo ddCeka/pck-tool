@@ -3,7 +3,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
-#include <limits.h>
+#include <errno.h>
 
 #include "pckProcess.h"
 #include "files.h"
@@ -13,10 +13,12 @@ void usage(void) {
     printf(
         "usage: pckt <unpack|pack|list> <in> [out] [options]\n"
         "options:\n"
-        "  --key <64-hex>       AES-256 hex decryption key\n"
-        "  --key-file <path>    Read 64-char hex key from file\n"
-        "  --embed <exe>        Bundle packed PCK into a base Godot executable\n"
-        "  --v1|--v2|--v3|--v4  Target pack version (default: v3)\n"
+        "  --key <64-hex>          AES-256 hex decryption key (unpack/list)\n"
+        "  --key-file <path>       Read 64-char hex key from file (unpack/list)\n"
+        "  --v1|--v2|--v3|--v4     Target pack version (pack, default: v3)\n"
+        "  --engine <M.m.p>        Target Godot engine version (pack, e.g. 4.3.0)\n"
+        "  --copy-meta <pck|exe>   Copy format & engine version from source PCK/EXE (pack)\n"
+        "  --embed <exe>           Bundle packed PCK into a Godot executable (pack)\n"
     );
     exit(1);
 }
@@ -37,18 +39,54 @@ static void loadKeyFromFile(const char* keyPath, u8 outKey[32]) {
         panic("loadKeyFromFile: key file \"%s\" must contain 64 hex chars", keyPath);
 }
 
-static bool pathsReferToSameFile(const char* pathA, const char* pathB) {
-    if (!pathA || !pathB)
+static bool parseEngineVersion(const char* str, PckEngineVersion* outVer) {
+    if (!str || !*str)
         return false;
-    if (strcmp(pathA, pathB) == 0)
+
+    u32 parts[3] = { 0 };
+    const char* cur = str;
+
+    for (int i = 0; i < 3; i++) {
+        if (*cur < '0' || *cur > '9')
+            return false;
+
+        errno = 0;
+        char* end = NULL;
+        unsigned long val = strtoul(cur, &end, 10);
+        if (errno != 0 || end == cur || val > UINT32_MAX)
+            return false;
+
+        parts[i] = (u32)val;
+        if (i < 2) {
+            if (*end != '.')
+                return false;
+            cur = end + 1;
+        } else {
+            if (*end != '\0')
+                return false;
+        }
+    }
+
+    outVer->majorVersion = parts[0];
+    outVer->minorVersion = parts[1];
+    outVer->patchVersion = parts[2];
+    return true;
+}
+
+static bool isSameFilePath(const char* a, const char* b) {
+    if (!a || !b)
+        return false;
+    if (strcmp(a, b) == 0)
         return true;
 
-    char realA[PATH_MAX];
-    char realB[PATH_MAX];
-    if (realpath(pathA, realA) && realpath(pathB, realB)) {
-        return strcmp(realA, realB) == 0;
-    }
-    return false;
+    char* realA = realpath(a, NULL);
+    char* realB = realpath(b, NULL);
+    bool same = false;
+    if (realA && realB && strcmp(realA, realB) == 0)
+        same = true;
+    free(realA);
+    free(realB);
+    return same;
 }
 
 int main(int argc, char** argv) {
@@ -67,19 +105,37 @@ int main(int argc, char** argv) {
         optStart = 4;
     }
 
-    u32 targetFormatVersion = PCK_VERSION_LATEST;
+    bool hasExplicitVersion = false;
+    u32 explicitFormatVersion = PCK_VERSION_LATEST;
+
+    bool hasExplicitEngine = false;
+    PckEngineVersion explicitEngineVersion = { 0 };
+
+    const char* copyMetaPath = NULL;
     const char* embedExePath = NULL;
     PckDecryptOptions decryptOpts = { .hasKey = false };
 
     for (int i = optStart; i < argc; i++) {
         if (strcmp(argv[i], "--v1") == 0) {
-            targetFormatVersion = PCK_VERSION_V1;
+            hasExplicitVersion = true;
+            explicitFormatVersion = PCK_VERSION_V1;
         } else if (strcmp(argv[i], "--v2") == 0) {
-            targetFormatVersion = PCK_VERSION_V2;
+            hasExplicitVersion = true;
+            explicitFormatVersion = PCK_VERSION_V2;
         } else if (strcmp(argv[i], "--v3") == 0) {
-            targetFormatVersion = PCK_VERSION_V3;
+            hasExplicitVersion = true;
+            explicitFormatVersion = PCK_VERSION_V3;
         } else if (strcmp(argv[i], "--v4") == 0) {
-            targetFormatVersion = PCK_VERSION_V4;
+            hasExplicitVersion = true;
+            explicitFormatVersion = PCK_VERSION_V4;
+        } else if (strcmp(argv[i], "--engine") == 0) {
+            if (i + 1 >= argc) usage();
+            if (!parseEngineVersion(argv[++i], &explicitEngineVersion))
+                panic("Invalid --engine: expected <major.minor.patch> (e.g. 4.3.0)");
+            hasExplicitEngine = true;
+        } else if (strcmp(argv[i], "--copy-meta") == 0) {
+            if (i + 1 >= argc) usage();
+            copyMetaPath = argv[++i];
         } else if (strcmp(argv[i], "--key") == 0) {
             if (i + 1 >= argc) usage();
             if (!parseHexKey256(argv[++i], decryptOpts.key))
@@ -97,25 +153,51 @@ int main(int argc, char** argv) {
         }
     }
 
-    if (embedExePath != NULL && strcasecmp(mode, "pack") != 0) {
-        panic("--embed can only be used with 'pack' mode");
-    }
-
     if (strcasecmp(mode, "list") == 0) {
+        if (embedExePath || copyMetaPath || hasExplicitVersion || hasExplicitEngine)
+            panic("--embed, --copy-meta, --engine, and --v1..--v4 are only valid in pack mode");
         FileHandle fileHndl = FileCreateHandle(inputPath);
         PckPreprocess(fileHndl.data_u8, fileHndl.size, &decryptOpts);
         PckListAll(fileHndl.data_u8, fileHndl.size, &decryptOpts);
         FileDestroyHandle(fileHndl);
     } else if (strcasecmp(mode, "unpack") == 0) {
+        if (embedExePath || copyMetaPath || hasExplicitVersion || hasExplicitEngine)
+            panic("--embed, --copy-meta, --engine, and --v1..--v4 are only valid in pack mode");
         FileHandle fileHndl = FileCreateHandle(inputPath);
         PckPreprocess(fileHndl.data_u8, fileHndl.size, &decryptOpts);
         PckExtractAll(fileHndl.data_u8, fileHndl.size, outputPath, &decryptOpts);
         FileDestroyHandle(fileHndl);
         printf("Done -> %s/\n", outputPath);
     } else if (strcasecmp(mode, "pack") == 0) {
-        if (embedExePath != NULL && pathsReferToSameFile(embedExePath, outputPath)) {
-            panic("--embed input executable and output path cannot be the same file");
+        if (decryptOpts.hasKey)
+            panic("--key and --key-file are only supported for list and unpack");
+        if (embedExePath && isSameFilePath(embedExePath, outputPath))
+            panic("--embed input executable and output path must not be the same file");
+
+        u32 targetFormatVersion = PCK_VERSION_LATEST;
+        PckEngineVersion engineVersion = {
+            .majorVersion = 4,
+            .minorVersion = 6,
+            .patchVersion = 0
+        };
+
+        if (copyMetaPath != NULL) {
+            FileHandle metaHndl = FileCreateHandle(copyMetaPath);
+            PckMetadata meta = PckReadMetadata(metaHndl.data_u8, metaHndl.size);
+            FileDestroyHandle(metaHndl);
+
+            targetFormatVersion = meta.formatVersion;
+            engineVersion = meta.engineVersion;
+        } else if (hasExplicitVersion && explicitFormatVersion == PCK_VERSION_V1) {
+            engineVersion.majorVersion = 3;
+            engineVersion.minorVersion = 6;
+            engineVersion.patchVersion = 0;
         }
+
+        if (hasExplicitVersion)
+            targetFormatVersion = explicitFormatVersion;
+        if (hasExplicitEngine)
+            engineVersion = explicitEngineVersion;
 
         GetAllFilesResult r = getAllFiles(inputPath);
 
@@ -129,12 +211,6 @@ int main(int argc, char** argv) {
         }
         free(r.fullFilenames);
         free(r.truncatedFilenames);
-
-        PckEngineVersion engineVersion = {
-            .majorVersion = (targetFormatVersion == PCK_VERSION_V1) ? 3 : 4,
-            .minorVersion = 6,
-            .patchVersion = 0
-        };
 
         PckBuildToFile(buildFiles, r.fileCount, outputPath, embedExePath, engineVersion, targetFormatVersion);
 
