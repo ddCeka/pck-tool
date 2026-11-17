@@ -1,36 +1,24 @@
+#define _POSIX_C_SOURCE 200809L
 #include "common.h"
 
 #include <stdlib.h>
-
 #include <stdarg.h>
-
 #include <string.h>
-
-#ifdef _WIN32
-#include <direct.h>
-#include <sys/types.h>
+#include <ctype.h>
 #include <sys/stat.h>
-
-#define mkdir _mkdir
-#else
-#include <sys/stat.h>
-
-#include <unistd.h>  // For POSIX mkdir
-#endif
-
+#include <unistd.h>
 #include <dirent.h>
 
 void panic(const char* fmt, ...) {
     va_list args;
     va_start(args, fmt);
 
-    char buffer[1024];
+    char buffer[2048];
     vsnprintf(buffer, sizeof(buffer), fmt, args);
 
-    printf("\nPANIC: %s\n\n", buffer);
+    fprintf(stderr, "\nPANIC: %s\n\n", buffer);
 
     va_end(args);
-
     exit(1);
 }
 
@@ -38,65 +26,45 @@ void warn(const char* fmt, ...) {
     va_list args;
     va_start(args, fmt);
 
-    char buffer[1024];
+    char buffer[2048];
     vsnprintf(buffer, sizeof(buffer), fmt, args);
 
-    printf("\nWARN: %s\n\n", buffer);
+    fprintf(stderr, "\nWARN: %s\n\n", buffer);
 
     va_end(args);
 }
 
 char* getFilename(char* path) {
     char* lastSlash = strrchr(path, '/');
-    if (!lastSlash)
-        lastSlash = strrchr(path, '\\');
-
-    if (!lastSlash)
-        return path;
-
-    return (char*)(lastSlash + 1);
+    return lastSlash ? (lastSlash + 1) : path;
 }
 
 char* getExtension(char* path) {
     char* lastDot = strrchr(path, '.');
-    if (!lastDot)
-        return path + strlen(path);
-
-    return lastDot;
+    return lastDot ? lastDot : (path + strlen(path));
 }
 
 void createDirectory(const char* path) {
-    #ifdef _WIN32
-    struct _stat st = { 0 };
-    #else
-    struct stat st = { 0 };
-    #endif
+    if (path[0] == '\0')
+        return;
 
+    struct stat st = { 0 };
     if (stat(path, &st) == -1) {
-        #ifdef _WIN32
-        if (mkdir(path) != 0)
-        #else
-        if (mkdir(path, 0700) != 0)
-        #endif
-            panic("createDirectory: mkdir failed");
+        if (mkdir(path, 0755) != 0)
+            panic("createDirectory: mkdir failed for \"%s\"", path);
     }
 }
 
 void createDirectoryTree(const char* path) {
-    char tempPath[1024];
-    char* c = NULL;
-    u64 len;
-
+    char tempPath[4096];
     snprintf(tempPath, sizeof(tempPath), "%s", path);
-    len = strlen(tempPath);
+    size_t len = strlen(tempPath);
 
-    for (c = tempPath + 1; c < tempPath + len; c++) {
-        if (*c == PATH_SEPARATOR_C) {
-            *c = '\0'; // Temporarily null-terminate string
-
+    for (size_t i = 1; i < len; i++) {
+        if (tempPath[i] == '/') {
+            tempPath[i] = '\0';
             createDirectory(tempPath);
-
-            *c = PATH_SEPARATOR_C;
+            tempPath[i] = '/';
         }
     }
 
@@ -105,30 +73,36 @@ void createDirectoryTree(const char* path) {
 
 static int _isDirectory(const char* path) {
     struct stat statbuf;
-    if (stat(path, &statbuf) != 0) {
-        return 0; // Cannot access path, assume not a directory
-    }
+    if (stat(path, &statbuf) != 0)
+        return 0;
     return S_ISDIR(statbuf.st_mode);
 }
 
-static void _getAllFiles(const char* path, const char* root, unsigned rootLength, GetAllFilesResult* result) {
+static void _getAllFiles(const char* path, size_t rootLength, GetAllFilesResult* result, unsigned* capacity) {
     struct dirent* entry;
     DIR* dir = opendir(path);
 
     if (dir == NULL)
-        panic("_getAllFiles: unable to open directory");
+        panic("_getAllFiles: unable to open directory \"%s\"", path);
 
     while ((entry = readdir(dir)) != NULL) {
         if (strcmp(entry->d_name, ".") != 0 && strcmp(entry->d_name, "..") != 0) {
-            char fullPath[1024];
+            char fullPath[4096];
             snprintf(fullPath, sizeof(fullPath), "%s/%s", path, entry->d_name);
 
-            if (_isDirectory(fullPath))
-                _getAllFiles(fullPath, root, rootLength, result);
-            else {
-                result->fullFilenames[result->fileCount] = strdup(fullPath);
-                result->truncatedFilenames[result->fileCount] = strdup(fullPath + rootLength + 1); // Skip root and trailing slash
+            if (_isDirectory(fullPath)) {
+                _getAllFiles(fullPath, rootLength, result, capacity);
+            } else {
+                if (result->fileCount >= *capacity) {
+                    *capacity *= 2;
+                    result->fullFilenames = realloc(result->fullFilenames, sizeof(char*) * (*capacity));
+                    result->truncatedFilenames = realloc(result->truncatedFilenames, sizeof(char*) * (*capacity));
+                    if (!result->fullFilenames || !result->truncatedFilenames)
+                        panic("_getAllFiles: realloc failed");
+                }
 
+                result->fullFilenames[result->fileCount] = strdup(fullPath);
+                result->truncatedFilenames[result->fileCount] = strdup(fullPath + rootLength + 1);
                 result->fileCount++;
             }
         }
@@ -138,12 +112,37 @@ static void _getAllFiles(const char* path, const char* root, unsigned rootLength
 }
 
 GetAllFilesResult getAllFiles(const char* rootPath) {
+    unsigned capacity = 1024;
     GetAllFilesResult result;
     result.fileCount = 0;
-    result.fullFilenames = (char**)malloc(sizeof(char*) * 1024); // Allocating space for 1024 filenames
-    result.truncatedFilenames = (char**)malloc(sizeof(char*) * 1024);
+    result.fullFilenames = malloc(sizeof(char*) * capacity);
+    result.truncatedFilenames = malloc(sizeof(char*) * capacity);
 
-    _getAllFiles(rootPath, rootPath, strlen(rootPath), &result);
+    size_t rootLen = strlen(rootPath);
+    while (rootLen > 1 && rootPath[rootLen - 1] == '/')
+        rootLen--;
 
+    _getAllFiles(rootPath, rootLen, &result, &capacity);
     return result;
+}
+
+static int _hexVal(char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
+bool parseHexKey256(const char* hexStr, u8 outKey[32]) {
+    if (!hexStr || strlen(hexStr) != 64)
+        return false;
+
+    for (size_t i = 0; i < 32; i++) {
+        int hi = _hexVal(hexStr[i * 2]);
+        int lo = _hexVal(hexStr[i * 2 + 1]);
+        if (hi < 0 || lo < 0)
+            return false;
+        outKey[i] = (u8)((hi << 4) | lo);
+    }
+    return true;
 }
