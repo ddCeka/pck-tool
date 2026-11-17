@@ -21,64 +21,17 @@
 #define PCK_ALIGNMENT_V3 (32)
 #define AES_BLOCK_SIZE   (16)
 
-// Embedded executable footer: [u64 pckSize][u32 "GDPC"]
-#define PCK_EMBED_FOOTER_SIZE (12)
+// Binary wire sizes (explicit constants avoid compiler padding ambiguity)
+#define PCK_HEADER_PREFIX_SIZE   (20)
+#define PCK_HEADER_V1_SIZE       (84)
+#define PCK_HEADER_V2_SIZE       (96)
+#define PCK_ENTRY_V1_SIZE        (32)
+#define PCK_ENTRY_V2_SIZE        (36)
+#define PCK_ENC_HEADER_SIZE      (40)
+#define PCK_EMBED_FOOTER_SIZE    (12)
 
 // Folder name used on disk when unpacking user:// entries
 #define USER_SCHEME_DIR "__user__"
-
-typedef struct __attribute__((packed)) {
-    u32 size;
-    char content[];
-} PckString;
-
-// V1 file entry (32 bytes, no flags field)
-typedef struct __attribute__((packed)) {
-    u64 dataOffset; // Absolute offset from start of PCK/EXE
-    u64 dataSize;
-    unsigned char md5Hash[16];
-} PckFileEntryV1;
-
-// V2/V3/V4 file entry (36 bytes, includes flags)
-typedef struct __attribute__((packed)) {
-    u64 dataOffset; // Relative to effective data base
-    u64 dataSize;   // Unencrypted plaintext size
-    unsigned char md5Hash[16];
-    u32 flags;
-} PckFileEntry;
-
-// Common header prefix shared by V1, V2, V3, and V4 (20 bytes)
-typedef struct __attribute__((packed)) {
-    u32 magic;         // "GDPC"
-    u32 formatVersion; // 1, 2, 3, or 4
-    PckEngineVersion engineVersion;
-} PckHeaderPrefix;
-
-// V1 header (84 bytes total; followed immediately by u32 fileCount)
-typedef struct __attribute__((packed)) {
-    u32 magic;         // "GDPC"
-    u32 formatVersion; // 1
-    PckEngineVersion engineVersion;
-    u32 reserved[16];
-} PckFileHeaderV1;
-
-// V2/V3/V4 header (96 bytes total)
-typedef struct __attribute__((packed)) {
-    u32 magic;             // "GDPC"
-    u32 formatVersion;     // 2, 3, or 4
-    PckEngineVersion engineVersion;
-    u32 flags;             // PCK_FLAG_*
-    u64 dataSectionOffset; // file_base
-    u64 dirOffset;         // Directory offset in V3/V4 (reserved in V2)
-    u32 reserved[14];
-} PckFileHeader;
-
-// Godot FileAccessEncrypted stream header (when p_with_magic = false)
-typedef struct __attribute__((packed)) {
-    unsigned char md5Hash[16]; // MD5 of decrypted plaintext
-    u64 plaintextLength;       // Exact unpadded plaintext byte count
-    unsigned char iv[16];      // 128-bit IV for AES-256-CFB
-} GodotEncryptedHeader;
 
 typedef struct {
     const u8* pckStart;       // Pointer to "GDPC" header
@@ -104,7 +57,6 @@ static void _PckPrintRule(void) {
     printf("------------------------------------------------------------\n");
 }
 
-// Formats path to fit in maxCols (e.g. 44 chars), keeping filename suffix with "..."
 static void _PckTruncatePath(const char* src, size_t srcLen, char* dst, size_t maxCols) {
     if (srcLen <= maxCols) {
         memcpy(dst, src, srcLen);
@@ -128,11 +80,11 @@ static PckResolvedView _PckResolveView(const u8* fileData, u64 fileSize) {
     view.fileOrigin = fileData;
     view.totalFileSize = fileSize;
 
-    if (fileSize < sizeof(PckHeaderPrefix) + sizeof(u32))
+    if (fileSize < PCK_HEADER_PREFIX_SIZE + sizeof(u32))
         panic("PckPreprocess: File too small to be a valid PCK");
 
     // 1. Check standalone PCK (starts directly with "GDPC")
-    if (*(const u32*)fileData == GDPC_MAGIC) {
+    if (read_u32_le(fileData) == GDPC_MAGIC) {
         view.pckStart = fileData;
         view.pckRegionSize = fileSize;
         view.embeddedOffset = 0;
@@ -141,15 +93,15 @@ static PckResolvedView _PckResolveView(const u8* fileData, u64 fileSize) {
     }
 
     // 2. Check embedded PCK footer at end of executable: [u64 pckSize][u32 "GDPC"]
-    if (fileSize >= PCK_EMBED_FOOTER_SIZE + sizeof(PckHeaderPrefix) + sizeof(u32)) {
+    if (fileSize >= PCK_EMBED_FOOTER_SIZE + PCK_HEADER_PREFIX_SIZE + sizeof(u32)) {
         const u8* footer = fileData + fileSize - PCK_EMBED_FOOTER_SIZE;
-        u32 footerMagic = *(const u32*)(footer + sizeof(u64));
+        u32 footerMagic = read_u32_le(footer + sizeof(u64));
         if (footerMagic == GDPC_MAGIC) {
-            u64 embeddedPckSize = *(const u64*)footer;
-            if (embeddedPckSize >= sizeof(PckHeaderPrefix) + sizeof(u32) &&
+            u64 embeddedPckSize = read_u64_le(footer);
+            if (embeddedPckSize >= PCK_HEADER_PREFIX_SIZE + sizeof(u32) &&
                 embeddedPckSize <= fileSize - PCK_EMBED_FOOTER_SIZE) {
                 u64 pckOffset = fileSize - PCK_EMBED_FOOTER_SIZE - embeddedPckSize;
-                if (*(const u32*)(fileData + pckOffset) == GDPC_MAGIC) {
+                if (read_u32_le(fileData + pckOffset) == GDPC_MAGIC) {
                     view.pckStart = fileData + pckOffset;
                     view.pckRegionSize = embeddedPckSize;
                     view.embeddedOffset = pckOffset;
@@ -202,15 +154,18 @@ static u8* _PckDecryptStream(
     MD5Context md5Ctx,
     u64* outPlaintextSize
 ) {
-    if (maxAvailableBytes < sizeof(GodotEncryptedHeader))
+    if (maxAvailableBytes < PCK_ENC_HEADER_SIZE)
         panic("_PckDecryptStream: Encrypted stream truncated before header");
 
-    const GodotEncryptedHeader* encHdr = (const GodotEncryptedHeader*)encStream;
-    u64 plainLen = encHdr->plaintextLength;
-    u64 paddedCipherLen = _PckAlignU64(plainLen, AES_BLOCK_SIZE);
-    u64 totalRequired = sizeof(GodotEncryptedHeader) + paddedCipherLen;
+    const unsigned char* expectedMd5 = encStream;
+    u64 plainLen = read_u64_le(encStream + 16);
+    const unsigned char* iv = encStream + 24;
 
-    if (totalRequired > maxAvailableBytes)
+    if (plainLen > maxAvailableBytes - PCK_ENC_HEADER_SIZE)
+        panic("_PckDecryptStream: Encrypted plaintext length exceeds bounds");
+
+    u64 paddedCipherLen = _PckAlignU64(plainLen, AES_BLOCK_SIZE);
+    if (paddedCipherLen > maxAvailableBytes - PCK_ENC_HEADER_SIZE)
         panic("_PckDecryptStream: Encrypted payload exceeds bounds");
 
     u8* decryptedBuf = malloc(paddedCipherLen > 0 ? paddedCipherLen : 1);
@@ -218,17 +173,20 @@ static u8* _PckDecryptStream(
         panic("_PckDecryptStream: malloc failed");
 
     EVP_CIPHER_CTX* ctx = EVP_CIPHER_CTX_new();
-    if (!ctx)
+    if (!ctx) {
+        free(decryptedBuf);
         panic("_PckDecryptStream: EVP_CIPHER_CTX_new failed");
+    }
 
-    if (EVP_DecryptInit_ex(ctx, EVP_aes_256_cfb128(), NULL, key, encHdr->iv) != 1) {
+    if (EVP_DecryptInit_ex(ctx, EVP_aes_256_cfb128(), NULL, key, iv) != 1) {
         EVP_CIPHER_CTX_free(ctx);
+        free(decryptedBuf);
         panic("_PckDecryptStream: EVP_DecryptInit_ex failed");
     }
 
     EVP_CIPHER_CTX_set_padding(ctx, 0);
 
-    const u8* cipherPtr = encStream + sizeof(GodotEncryptedHeader);
+    const u8* cipherPtr = encStream + PCK_ENC_HEADER_SIZE;
     u64 remaining = paddedCipherLen;
     u64 offset = 0;
 
@@ -255,9 +213,9 @@ static u8* _PckDecryptStream(
     unsigned char computedHash[16];
     _PckProduceMD5(decryptedBuf, plainLen, md5Ctx, computedHash);
 
-    if (memcmp(computedHash, encHdr->md5Hash, 16) != 0) {
+    if (memcmp(computedHash, expectedMd5, 16) != 0) {
         char expStr[33], gotStr[33];
-        _PckMD5ToString(encHdr->md5Hash, expStr);
+        _PckMD5ToString(expectedMd5, expStr);
         _PckMD5ToString(computedHash, gotStr);
         free(decryptedBuf);
         panic("Decryption MD5 mismatch (expected %s, got %s)", expStr, gotStr);
@@ -269,30 +227,30 @@ static u8* _PckDecryptStream(
 
 void PckPreprocess(u8* pckData, u64 pckSize, const PckDecryptOptions* decryptOpts) {
     PckResolvedView view = _PckResolveView(pckData, pckSize);
-    const PckHeaderPrefix* prefix = (const PckHeaderPrefix*)view.pckStart;
+    u32 formatVersion = read_u32_le(view.pckStart + 4);
 
-    if (prefix->formatVersion != PCK_VERSION_V1 &&
-        prefix->formatVersion != PCK_VERSION_V2 &&
-        prefix->formatVersion != PCK_VERSION_V3 &&
-        prefix->formatVersion != PCK_VERSION_V4) {
-        panic("PckPreprocess: Unsupported PCK format version %u (expected 1..4)", prefix->formatVersion);
+    if (formatVersion != PCK_VERSION_V1 &&
+        formatVersion != PCK_VERSION_V2 &&
+        formatVersion != PCK_VERSION_V3 &&
+        formatVersion != PCK_VERSION_V4) {
+        panic("PckPreprocess: Unsupported PCK format version %u (expected 1..4)", formatVersion);
     }
 
-    if (prefix->formatVersion == PCK_VERSION_V1) {
-        if (view.pckRegionSize < sizeof(PckFileHeaderV1) + sizeof(u32))
+    if (formatVersion == PCK_VERSION_V1) {
+        if (view.pckRegionSize < PCK_HEADER_V1_SIZE + sizeof(u32))
             panic("PckPreprocess: V1 PCK header truncated");
         return;
     }
 
-    if (view.pckRegionSize < sizeof(PckFileHeader) + sizeof(u32))
+    if (view.pckRegionSize < PCK_HEADER_V2_SIZE + sizeof(u32))
         panic("PckPreprocess: PCK header truncated");
 
-    const PckFileHeader* fileHeader = (const PckFileHeader*)view.pckStart;
+    u32 flags = read_u32_le(view.pckStart + 20);
 
-    if ((fileHeader->flags & PCK_FLAG_DIR_ENCRYPTED) && (!decryptOpts || !decryptOpts->hasKey))
+    if ((flags & PCK_FLAG_DIR_ENCRYPTED) && (!decryptOpts || !decryptOpts->hasKey))
         panic("PckPreprocess: Encrypted PCK directory requires --key or --key-file");
 
-    if (fileHeader->flags & PCK_FLAG_SPARSE_BUNDLE)
+    if (flags & PCK_FLAG_SPARSE_BUNDLE)
         panic("PckPreprocess: Sparse bundle PCK is not supported");
 }
 
@@ -326,44 +284,48 @@ static PckDirSession _PckOpenDirSession(
     MD5Context md5Context
 ) {
     PckDirSession sess = { 0 };
-    const PckHeaderPrefix* prefix = (const PckHeaderPrefix*)view->pckStart;
-    sess.formatVersion = prefix->formatVersion;
-    sess.engineVersion = prefix->engineVersion;
+    sess.formatVersion = read_u32_le(view->pckStart + 4);
+    sess.engineVersion.majorVersion = read_u32_le(view->pckStart + 8);
+    sess.engineVersion.minorVersion = read_u32_le(view->pckStart + 12);
+    sess.engineVersion.patchVersion = read_u32_le(view->pckStart + 16);
 
     u64 dirTableOffset = 0;
 
     if (sess.formatVersion == PCK_VERSION_V1) {
-        dirTableOffset = sizeof(PckFileHeaderV1);
+        dirTableOffset = PCK_HEADER_V1_SIZE;
         sess.dataBase = view->fileOrigin;
         sess.maxDataSpan = view->totalFileSize;
     } else {
-        const PckFileHeader* fileHeader = (const PckFileHeader*)view->pckStart;
+        u32 flags             = read_u32_le(view->pckStart + 20);
+        u64 dataSectionOffset = read_u64_le(view->pckStart + 24);
+        u64 dirOffset         = read_u64_le(view->pckStart + 32);
+
         dirTableOffset = (sess.formatVersion >= PCK_VERSION_V3)
-            ? fileHeader->dirOffset
-            : sizeof(PckFileHeader);
+            ? dirOffset
+            : PCK_HEADER_V2_SIZE;
 
         bool useRelFilebase = (sess.formatVersion >= PCK_VERSION_V3) ||
-                              ((fileHeader->flags & PCK_FLAG_REL_FILEBASE) != 0);
+                              ((flags & PCK_FLAG_REL_FILEBASE) != 0);
 
         if (view->isEmbedded && !useRelFilebase) {
-            sess.dataBase = view->fileOrigin + fileHeader->dataSectionOffset;
-            sess.maxDataSpan = (fileHeader->dataSectionOffset <= view->totalFileSize)
-                ? (view->totalFileSize - fileHeader->dataSectionOffset)
-                : 0;
+            if (dataSectionOffset > view->totalFileSize)
+                panic("PckOpenDir: Data section offset out of bounds");
+            sess.dataBase = view->fileOrigin + dataSectionOffset;
+            sess.maxDataSpan = view->totalFileSize - dataSectionOffset;
         } else {
-            sess.dataBase = view->pckStart + fileHeader->dataSectionOffset;
-            sess.maxDataSpan = (fileHeader->dataSectionOffset <= view->pckRegionSize)
-                ? (view->pckRegionSize - fileHeader->dataSectionOffset)
-                : 0;
+            if (dataSectionOffset > view->pckRegionSize)
+                panic("PckOpenDir: Data section offset out of bounds");
+            sess.dataBase = view->pckStart + dataSectionOffset;
+            sess.maxDataSpan = view->pckRegionSize - dataSectionOffset;
         }
 
-        sess.isDirEncrypted = (fileHeader->flags & PCK_FLAG_DIR_ENCRYPTED) != 0;
+        sess.isDirEncrypted = (flags & PCK_FLAG_DIR_ENCRYPTED) != 0;
     }
 
-    if (dirTableOffset + sizeof(u32) > view->pckRegionSize)
+    if (dirTableOffset > view->pckRegionSize || view->pckRegionSize - dirTableOffset < sizeof(u32))
         panic("PckOpenDir: Directory offset out of bounds");
 
-    sess.fileCount = *(const u32*)(view->pckStart + dirTableOffset);
+    sess.fileCount = read_u32_le(view->pckStart + dirTableOffset);
     u64 dirEntriesOffset = dirTableOffset + sizeof(u32);
 
     sess.dirCursor = view->pckStart + dirEntriesOffset;
@@ -402,35 +364,31 @@ typedef struct {
 } PckParsedEntry;
 
 static bool _PckReadNextEntry(PckDirSession* sess, u32 idx, PckParsedEntry* outEntry) {
-    if (sess->dirCursor + sizeof(PckString) > sess->dirEnd)
+    size_t avail = (size_t)(sess->dirEnd - sess->dirCursor);
+    if (avail < sizeof(u32))
         panic("PckReadEntry: Unexpected end of directory at entry %u", idx);
 
-    const PckString* curName = (const PckString*)sess->dirCursor;
-    u64 paddedNameLen = _PckAlignU64(curName->size, PCK_ALIGNMENT_V2);
-    size_t entryStructSize = (sess->formatVersion == PCK_VERSION_V1)
-        ? sizeof(PckFileEntryV1)
-        : sizeof(PckFileEntry);
+    u32 rawNameSize = read_u32_le(sess->dirCursor);
+    if (rawNameSize > PCK_MAX_PATH_LEN)
+        panic("PckReadEntry: Entry %u path length (%u) exceeds max allowed", idx, rawNameSize);
 
-    if (sess->dirCursor + sizeof(PckString) + paddedNameLen + entryStructSize > sess->dirEnd)
+    u64 paddedNameLen = _PckAlignU64(rawNameSize, PCK_ALIGNMENT_V2);
+    size_t entryStructSize = (sess->formatVersion == PCK_VERSION_V1)
+        ? PCK_ENTRY_V1_SIZE
+        : PCK_ENTRY_V2_SIZE;
+
+    if (avail - sizeof(u32) < paddedNameLen + entryStructSize)
         panic("PckReadEntry: Truncated entry %u in directory table", idx);
 
-    outEntry->namePtr = curName->content;
-    outEntry->nameLen = _PckCleanNameLen(curName->content, curName->size);
+    const char* nameStart = (const char*)(sess->dirCursor + sizeof(u32));
+    outEntry->namePtr = nameStart;
+    outEntry->nameLen = _PckCleanNameLen(nameStart, rawNameSize);
 
-    const u8* entryPtr = sess->dirCursor + sizeof(PckString) + paddedNameLen;
-    if (sess->formatVersion == PCK_VERSION_V1) {
-        const PckFileEntryV1* e1 = (const PckFileEntryV1*)entryPtr;
-        outEntry->dataOffset = e1->dataOffset;
-        outEntry->dataSize   = e1->dataSize;
-        outEntry->md5Hash    = e1->md5Hash;
-        outEntry->flags      = 0;
-    } else {
-        const PckFileEntry* e2 = (const PckFileEntry*)entryPtr;
-        outEntry->dataOffset = e2->dataOffset;
-        outEntry->dataSize   = e2->dataSize;
-        outEntry->md5Hash    = e2->md5Hash;
-        outEntry->flags      = e2->flags;
-    }
+    const u8* entryPtr = sess->dirCursor + sizeof(u32) + paddedNameLen;
+    outEntry->dataOffset = read_u64_le(entryPtr + 0);
+    outEntry->dataSize   = read_u64_le(entryPtr + 8);
+    outEntry->md5Hash    = entryPtr + 16;
+    outEntry->flags      = (sess->formatVersion == PCK_VERSION_V1) ? 0 : read_u32_le(entryPtr + 32);
 
     sess->dirCursor = entryPtr + entryStructSize;
     return true;
@@ -454,11 +412,6 @@ void PckExtractAll(u8* pckData, u64 pckSize, const char* outputDirectory, const 
         PckParsedEntry entry;
         _PckReadNextEntry(&sess, i, &entry);
 
-        bool isFileEncrypted = (entry.flags & PCK_FILE_FLAG_ENCRYPTED) != 0;
-        if (isFileEncrypted && (!decryptOpts || !decryptOpts->hasKey))
-            panic("PckExtractAll: File \"%.*s\" is encrypted; provide --key",
-                  (int)entry.nameLen, entry.namePtr);
-
         char sizeStr[16];
         char shortName[48];
         _PckFormatSize(entry.dataSize, sizeStr, sizeof(sizeStr));
@@ -466,6 +419,16 @@ void PckExtractAll(u8* pckData, u64 pckSize, const char* outputDirectory, const 
 
         printf("  %-44s %9s", shortName, sizeStr);
         fflush(stdout);
+
+        if (entry.flags & PCK_FILE_FLAG_REMOVAL) {
+            printf("  SKIP (DEL)\n");
+            continue;
+        }
+
+        bool isFileEncrypted = (entry.flags & PCK_FILE_FLAG_ENCRYPTED) != 0;
+        if (isFileEncrypted && (!decryptOpts || !decryptOpts->hasKey))
+            panic("PckExtractAll: File \"%.*s\" is encrypted; provide --key",
+                  (int)entry.nameLen, entry.namePtr);
 
         if (entry.dataOffset > sess.maxDataSpan)
             panic("PckExtractAll: Entry \"%.*s\" offset out of bounds", (int)entry.nameLen, entry.namePtr);
@@ -491,7 +454,7 @@ void PckExtractAll(u8* pckData, u64 pckSize, const char* outputDirectory, const 
             hndl.data_u8 = decryptedFileBuf;
             hndl.size = plainFileSize;
         } else {
-            if (entry.dataOffset + entry.dataSize > sess.maxDataSpan)
+            if (entry.dataSize > sess.maxDataSpan - entry.dataOffset)
                 panic("PckExtractAll: Entry \"%.*s\" exceeds bounds", (int)entry.nameLen, entry.namePtr);
 
             hndl.data_u8 = (u8*)(sess.dataBase + entry.dataOffset);
@@ -513,15 +476,15 @@ void PckExtractAll(u8* pckData, u64 pckSize, const char* outputDirectory, const 
         //   res://foo/bar  -> <out>/foo/bar
         //   user://foo/bar -> <out>/__user__/foo/bar
         const char* relPath = entry.namePtr;
-        int relLen = (int)entry.nameLen;
+        size_t relLen = entry.nameLen;
         bool isUserScheme = false;
 
-        if (relLen >= (int)STR_LIT_LEN("res://") && strncmp(relPath, "res://", STR_LIT_LEN("res://")) == 0) {
+        if (relLen >= STR_LIT_LEN("res://") && strncmp(relPath, "res://", STR_LIT_LEN("res://")) == 0) {
             relPath += STR_LIT_LEN("res://");
-            relLen  -= (int)STR_LIT_LEN("res://");
-        } else if (relLen >= (int)STR_LIT_LEN("user://") && strncmp(relPath, "user://", STR_LIT_LEN("user://")) == 0) {
+            relLen  -= STR_LIT_LEN("res://");
+        } else if (relLen >= STR_LIT_LEN("user://") && strncmp(relPath, "user://", STR_LIT_LEN("user://")) == 0) {
             relPath += STR_LIT_LEN("user://");
-            relLen  -= (int)STR_LIT_LEN("user://");
+            relLen  -= STR_LIT_LEN("user://");
             isUserScheme = true;
         }
 
@@ -530,18 +493,32 @@ void PckExtractAll(u8* pckData, u64 pckSize, const char* outputDirectory, const 
             relLen--;
         }
 
-        char fullPath[1024];
-        if (isUserScheme) {
-            snprintf(fullPath, sizeof(fullPath), "%s/" USER_SCHEME_DIR "/%.*s", outputDirectory, relLen, relPath);
-        } else {
-            snprintf(fullPath, sizeof(fullPath), "%s/%.*s", outputDirectory, relLen, relPath);
+        if (!sanitizeRelPath(relPath, relLen)) {
+            if (decryptedFileBuf) free(decryptedFileBuf);
+            panic("PckExtractAll: Unsafe or invalid path \"%.*s\" (possible path traversal)",
+                  (int)entry.nameLen, entry.namePtr);
         }
 
-        char directoryPath[1024];
-        snprintf(directoryPath, sizeof(directoryPath), "%.*s", (int)(getFilename(fullPath) - fullPath), fullPath);
+        char fullPath[PCK_MAX_PATH_LEN];
+        int written = isUserScheme
+            ? snprintf(fullPath, sizeof(fullPath), "%s/" USER_SCHEME_DIR "/%.*s", outputDirectory, (int)relLen, relPath)
+            : snprintf(fullPath, sizeof(fullPath), "%s/%.*s", outputDirectory, (int)relLen, relPath);
+
+        if (written < 0 || (size_t)written >= sizeof(fullPath)) {
+            if (decryptedFileBuf) free(decryptedFileBuf);
+            panic("PckExtractAll: Destination path exceeds %d bytes", PCK_MAX_PATH_LEN);
+        }
+
+        char directoryPath[PCK_MAX_PATH_LEN];
+        size_t dirLen = (size_t)(getFilename(fullPath) - fullPath);
+        memcpy(directoryPath, fullPath, dirLen);
+        directoryPath[dirLen] = '\0';
 
         createDirectoryTree(directoryPath);
-        FileWriteHandle(hndl, fullPath);
+        if (FileWriteHandle(hndl, fullPath) != 0) {
+            if (decryptedFileBuf) free(decryptedFileBuf);
+            panic("PckExtractAll: Failed to write \"%s\"", fullPath);
+        }
 
         if (decryptedFileBuf)
             free(decryptedFileBuf);
@@ -572,6 +549,10 @@ void PckListAll(u8* pckData, u64 pckSize, const PckDecryptOptions* decryptOpts) 
     PckResolvedView view = _PckResolveView(pckData, pckSize);
     MD5Context md5Context = _PckCreateMD5Context();
     PckDirSession sess = _PckOpenDirSession(&view, decryptOpts, md5Context);
+
+    // Guard against bogus huge fileCount before allocating
+    if ((u64)sess.fileCount * (sizeof(u32) + PCK_ENTRY_V1_SIZE) > (u64)(sess.dirEnd - sess.dirCursor))
+        panic("PckListAll: Declared fileCount (%u) exceeds directory buffer size", sess.fileCount);
 
     PckListEntry* items = calloc(sess.fileCount > 0 ? sess.fileCount : 1, sizeof(PckListEntry));
     if (!items)
@@ -640,15 +621,21 @@ static size_t _PckFormatGodotUri(const char* localRelPath, char* outBuf, size_t 
     while (*localRelPath == '/')
         localRelPath++;
 
+    int written;
     const size_t userPrefixLen = STR_LIT_LEN(USER_SCHEME_DIR "/");
     if (strncmp(localRelPath, USER_SCHEME_DIR "/", userPrefixLen) == 0) {
         const char* sub = localRelPath + userPrefixLen;
         while (*sub == '/')
             sub++;
-        return (size_t)snprintf(outBuf, outBufSize, "user://%s", sub);
+        written = snprintf(outBuf, outBufSize, "user://%s", sub);
+    } else {
+        written = snprintf(outBuf, outBufSize, "res://%s", localRelPath);
     }
 
-    return (size_t)snprintf(outBuf, outBufSize, "res://%s", localRelPath);
+    if (written < 0 || (size_t)written >= outBufSize)
+        panic("_PckFormatGodotUri: URI exceeds %zu bytes", outBufSize);
+
+    return (size_t)written;
 }
 
 FileHandle PckBuild(PckBuildFile* files, u32 fileCount, PckEngineVersion engineVersion, u32 formatVersion) {
@@ -662,14 +649,14 @@ FileHandle PckBuild(PckBuildFile* files, u32 fileCount, PckEngineVersion engineV
     FileHandle resultHndl;
     const u64 alignment = (formatVersion == PCK_VERSION_V1) ? PCK_ALIGNMENT_V1 :
                           (formatVersion >= PCK_VERSION_V3) ? PCK_ALIGNMENT_V3 : PCK_ALIGNMENT_V2;
-    const size_t headerSize = (formatVersion == PCK_VERSION_V1) ? sizeof(PckFileHeaderV1) : sizeof(PckFileHeader);
-    const size_t entrySize  = (formatVersion == PCK_VERSION_V1) ? sizeof(PckFileEntryV1)  : sizeof(PckFileEntry);
+    const size_t headerSize = (formatVersion == PCK_VERSION_V1) ? PCK_HEADER_V1_SIZE : PCK_HEADER_V2_SIZE;
+    const size_t entrySize  = (formatVersion == PCK_VERSION_V1) ? PCK_ENTRY_V1_SIZE  : PCK_ENTRY_V2_SIZE;
 
-    char uriBuf[1024];
+    char uriBuf[PCK_MAX_PATH_LEN];
     u64 entrySectionSize = sizeof(u32);
     for (u32 i = 0; i < fileCount; i++) {
         size_t rawNameLen = _PckFormatGodotUri(files[i].filename, uriBuf, sizeof(uriBuf));
-        entrySectionSize += sizeof(PckString) + _PckAlignU64(rawNameLen, PCK_ALIGNMENT_V2);
+        entrySectionSize += sizeof(u32) + _PckAlignU64(rawNameLen, PCK_ALIGNMENT_V2);
         entrySectionSize += entrySize;
     }
 
@@ -709,26 +696,26 @@ FileHandle PckBuild(PckBuildFile* files, u32 fileCount, PckEngineVersion engineV
            totalStr);
     _PckPrintRule();
 
-    if (formatVersion == PCK_VERSION_V1) {
-        PckFileHeaderV1* hdr1 = (PckFileHeaderV1*)resultHndl.data_void;
-        hdr1->magic         = GDPC_MAGIC;
-        hdr1->formatVersion = PCK_VERSION_V1;
-        hdr1->engineVersion = engineVersion;
-    } else {
-        PckFileHeader* fileHeader = (PckFileHeader*)resultHndl.data_void;
-        fileHeader->magic             = GDPC_MAGIC;
-        fileHeader->formatVersion     = formatVersion;
-        fileHeader->engineVersion     = engineVersion;
-        fileHeader->flags             = (formatVersion >= PCK_VERSION_V3) ? PCK_FLAG_REL_FILEBASE : 0;
-        fileHeader->dataSectionOffset = dataSectionOffset;
-        fileHeader->dirOffset         = (formatVersion >= PCK_VERSION_V3) ? dirSectionOffset : 0;
+    u8* hdr = resultHndl.data_u8;
+    write_u32_le(hdr + 0,  GDPC_MAGIC);
+    write_u32_le(hdr + 4,  formatVersion);
+    write_u32_le(hdr + 8,  engineVersion.majorVersion);
+    write_u32_le(hdr + 12, engineVersion.minorVersion);
+    write_u32_le(hdr + 16, engineVersion.patchVersion);
+
+    if (formatVersion >= PCK_VERSION_V2) {
+        u32 flags = (formatVersion >= PCK_VERSION_V3) ? PCK_FLAG_REL_FILEBASE : 0;
+        u64 dirOff = (formatVersion >= PCK_VERSION_V3) ? dirSectionOffset : 0;
+        write_u32_le(hdr + 20, flags);
+        write_u64_le(hdr + 24, dataSectionOffset);
+        write_u64_le(hdr + 32, dirOff);
     }
 
     u8* const dataSectionStart = resultHndl.data_u8 + dataSectionOffset;
     u8* nextData = dataSectionStart;
 
     u8* dirCursor = resultHndl.data_u8 + dirSectionOffset;
-    *(u32*)dirCursor = fileCount;
+    write_u32_le(dirCursor, fileCount);
     dirCursor += sizeof(u32);
 
     MD5Context md5Context = _PckCreateMD5Context();
@@ -745,27 +732,22 @@ FileHandle PckBuild(PckBuildFile* files, u32 fileCount, PckEngineVersion engineV
         _PckTruncatePath(uriBuf, rawNameLen, shortName, 44);
         printf("  %-44s %9s  OK\n", shortName, sizeStr);
 
-        PckString* name = (PckString*)dirCursor;
-        name->size = (u32)paddedNameLen;
-        memcpy(name->content, uriBuf, rawNameLen);
-
-        dirCursor += sizeof(PckString) + paddedNameLen;
+        write_u32_le(dirCursor, (u32)paddedNameLen);
+        memcpy(dirCursor + sizeof(u32), uriBuf, rawNameLen);
+        dirCursor += sizeof(u32) + paddedNameLen;
 
         unsigned char md5[16];
         _PckProduceMD5(file->hndl.data_void, file->hndl.size, md5Context, md5);
 
-        if (formatVersion == PCK_VERSION_V1) {
-            PckFileEntryV1* e1 = (PckFileEntryV1*)dirCursor;
-            e1->dataOffset = (u64)(nextData - resultHndl.data_u8);
-            e1->dataSize   = file->hndl.size;
-            memcpy(e1->md5Hash, md5, 16);
-        } else {
-            PckFileEntry* e2 = (PckFileEntry*)dirCursor;
-            e2->dataOffset = (u64)(nextData - dataSectionStart);
-            e2->dataSize   = file->hndl.size;
-            e2->flags      = 0;
-            memcpy(e2->md5Hash, md5, 16);
-        }
+        u64 writtenOffset = (formatVersion == PCK_VERSION_V1)
+            ? (u64)(nextData - resultHndl.data_u8)
+            : (u64)(nextData - dataSectionStart);
+
+        write_u64_le(dirCursor + 0, writtenOffset);
+        write_u64_le(dirCursor + 8, file->hndl.size);
+        memcpy(dirCursor + 16, md5, 16);
+        if (formatVersion >= PCK_VERSION_V2)
+            write_u32_le(dirCursor + 32, 0);
 
         dirCursor += entrySize;
 
