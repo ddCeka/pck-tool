@@ -3,27 +3,56 @@
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
-#include <ctype.h>
-#include <errno.h>
 #include <limits.h>
+#include <errno.h>
 
 #include "pckProcess.h"
 #include "files.h"
 #include "common.h"
 
+#define PCK_TERM_COLS 60
+
 void usage(void) {
     printf(
-        "usage: pckt <unpack|pack|list> <in> [out] [options]\n"
-        "options:\n"
-        "  --key <64-hex>          AES-256 hex decryption key (list/unpack)\n"
-        "  --key-file <path>       Read 64-char hex key from file (list/unpack)\n"
-        "  --filter <ext1,ext2>    Only include matching file extensions (list/unpack)\n"
-        "  --v1|--v2|--v3|--v4     Target pack version (default: v3)\n"
-        "  --engine <M.m.p>        Target Godot engine version (e.g., 4.3.0)\n"
-        "  --copy-meta <pck|exe>   Copy format & engine version from existing archive\n"
-        "  --embed <exe>           Bundle packed archive into a Godot executable\n"
+        "usage: pckt <list|unpack|pack> <in> [out] [options]\n"
+        "\n"
+        "modes:\n"
+        "  list <in>              List archive contents\n"
+        "  unpack <in> <out>      Extract archive to folder\n"
+        "  pack <in> <out>        Pack folder into .pck/exe\n"
+        "\n"
+        "list / unpack options:\n"
+        "  --key <64-hex>         AES-256 hex decryption key\n"
+        "  --key-file <path>      Read 64-char hex key file\n"
+        "  --filter <ext,...>     Filter by extension(s)\n"
+        "\n"
+        "pack options:\n"
+        "  --v1|--v2|--v3|--v4    PCK format (default: v3)\n"
+        "  --engine <M.m.p>       Set Godot engine version\n"
+        "  --copy-meta <pck|exe>  Copy format & engine ver\n"
+        "  --embed <exe>          Bundle PCK into executable\n"
     );
     exit(1);
+}
+
+static void printDoneLine60(const char* path, bool isDir) {
+    char raw[PCK_MAX_PATH_LEN + 16];
+    int n = isDir
+        ? snprintf(raw, sizeof(raw), "%s/", path)
+        : snprintf(raw, sizeof(raw), "%s", path);
+    if (n < 0) n = 0;
+    size_t len = (size_t)n;
+    if (len >= sizeof(raw)) len = sizeof(raw) - 1;
+
+    const size_t prefixLen = 8; // "Done -> "
+    const size_t maxPathCols = PCK_TERM_COLS - prefixLen; // 52 cols
+
+    if (len <= maxPathCols) {
+        printf("Done -> %.*s\n", (int)len, raw);
+    } else {
+        size_t keep = maxPathCols - 3;
+        printf("Done -> ...%.*s\n", (int)keep, raw + (len - keep));
+    }
 }
 
 static void loadKeyFromFile(const char* keyPath, u8 outKey[32]) {
@@ -43,34 +72,32 @@ static void loadKeyFromFile(const char* keyPath, u8 outKey[32]) {
 }
 
 static bool parseEngineVersion(const char* str, PckEngineVersion* outVer) {
-    if (!str || !*str)
+    if (!str || !outVer)
         return false;
 
     const char* p = str;
-    unsigned long parts[3] = { 0 };
+    unsigned long parts[3];
 
     for (int i = 0; i < 3; i++) {
-        if (!isdigit((unsigned char)*p))
+        if (*p < '0' || *p > '9')
             return false;
 
-        errno = 0;
         char* end = NULL;
+        errno = 0;
         unsigned long val = strtoul(p, &end, 10);
-        if (errno != 0 || val > UINT32_MAX || end == p)
+        if (errno != 0 || end == p || val > UINT32_MAX)
             return false;
 
         parts[i] = val;
-        p = end;
-
         if (i < 2) {
-            if (*p != '.')
+            if (*end != '.')
                 return false;
-            p++;
+            p = end + 1;
+        } else {
+            if (*end != '\0')
+                return false;
         }
     }
-
-    if (*p != '\0')
-        return false;
 
     outVer->majorVersion = (u32)parts[0];
     outVer->minorVersion = (u32)parts[1];
@@ -78,18 +105,18 @@ static bool parseEngineVersion(const char* str, PckEngineVersion* outVer) {
     return true;
 }
 
-static char** parseFilterExtensions(const char* rawList, u32* outCount) {
-    if (!rawList || *rawList == '\0')
-        panic("Invalid --filter: expected comma-separated extensions (e.g., .oggstr,.ctex)");
+static void parseFilterExtensions(const char* rawList, char*** outExts, u32* outCount) {
+    if (!rawList || rawList[0] == '\0')
+        panic("Invalid --filter: expected comma-separated extensions");
 
     char* copy = strdup(rawList);
     if (!copy)
         panic("parseFilterExtensions: strdup failed");
 
-    u32 cap = 16;
+    u32 cap = 8;
     u32 count = 0;
-    char** exts = malloc(sizeof(char*) * cap);
-    if (!exts) {
+    char** list = malloc(sizeof(char*) * cap);
+    if (!list) {
         free(copy);
         panic("parseFilterExtensions: malloc failed");
     }
@@ -105,67 +132,69 @@ static char** parseFilterExtensions(const char* rawList, u32* outCount) {
 
         if (len == 0 || (len == 1 && tok[0] == '.')) {
             free(copy);
-            for (u32 i = 0; i < count; i++) free(exts[i]);
-            free(exts);
             panic("Invalid --filter: empty extension token");
-        }
-
-        if (strchr(tok, '/') != NULL || strchr(tok, '\\') != NULL) {
-            free(copy);
-            for (u32 i = 0; i < count; i++) free(exts[i]);
-            free(exts);
-            panic("Invalid --filter: extension \"%s\" must not contain path separators", tok);
         }
 
         if (count >= cap) {
             cap *= 2;
-            char** tmp = realloc(exts, sizeof(char*) * cap);
+            char** tmp = realloc(list, sizeof(char*) * cap);
             if (!tmp) {
                 free(copy);
-                for (u32 i = 0; i < count; i++) free(exts[i]);
-                free(exts);
                 panic("parseFilterExtensions: realloc failed");
             }
-            exts = tmp;
+            list = tmp;
         }
 
         if (tok[0] == '.') {
-            exts[count] = strdup(tok);
+            list[count] = strdup(tok);
         } else {
-            exts[count] = malloc(len + 2);
-            if (exts[count]) {
-                exts[count][0] = '.';
-                memcpy(exts[count] + 1, tok, len + 1);
+            char* prefixed = malloc(len + 2);
+            if (!prefixed) {
+                free(copy);
+                panic("parseFilterExtensions: malloc failed");
             }
+            prefixed[0] = '.';
+            memcpy(prefixed + 1, tok, len + 1);
+            list[count] = prefixed;
         }
 
-        if (!exts[count]) {
+        if (!list[count]) {
             free(copy);
-            for (u32 i = 0; i < count; i++) free(exts[i]);
-            free(exts);
-            panic("parseFilterExtensions: malloc failed");
+            panic("parseFilterExtensions: allocation failed");
         }
-
         count++;
         tok = strtok_r(NULL, ",", &saveptr);
     }
 
     free(copy);
+    if (count == 0)
+        panic("Invalid --filter: no extensions provided");
 
-    if (count == 0) {
-        free(exts);
-        panic("Invalid --filter: expected at least one extension");
-    }
-
+    *outExts = list;
     *outCount = count;
-    return exts;
 }
 
 static void freeFilterExtensions(char** exts, u32 count) {
-    if (!exts) return;
+    if (!exts)
+        return;
     for (u32 i = 0; i < count; i++)
         free(exts[i]);
     free(exts);
+}
+
+static bool pathsReferToSameFile(const char* pathA, const char* pathB) {
+    if (strcmp(pathA, pathB) == 0)
+        return true;
+
+    char* realA = realpath(pathA, NULL);
+    char* realB = realpath(pathB, NULL);
+    bool same = false;
+    if (realA && realB) {
+        same = (strcmp(realA, realB) == 0);
+    }
+    free(realA);
+    free(realB);
+    return same;
 }
 
 int main(int argc, char** argv) {
@@ -192,7 +221,7 @@ int main(int argc, char** argv) {
     }
 
     u32 targetFormatVersion = PCK_VERSION_LATEST;
-    bool hasExplicitVersion = false;
+    bool hasExplicitFormat = false;
 
     PckEngineVersion explicitEngineVersion = { 0 };
     bool hasExplicitEngine = false;
@@ -201,41 +230,30 @@ int main(int argc, char** argv) {
     const char* embedExePath = NULL;
     PckDecryptOptions decryptOpts = { .hasKey = false };
 
-    char** filterExtList = NULL;
-    u32 filterExtCount = 0;
+    char** filterExts = NULL;
+    u32 filterCount = 0;
 
     for (int i = optStart; i < argc; i++) {
         if (strcmp(argv[i], "--v1") == 0) {
             targetFormatVersion = PCK_VERSION_V1;
-            hasExplicitVersion = true;
+            hasExplicitFormat = true;
         } else if (strcmp(argv[i], "--v2") == 0) {
             targetFormatVersion = PCK_VERSION_V2;
-            hasExplicitVersion = true;
+            hasExplicitFormat = true;
         } else if (strcmp(argv[i], "--v3") == 0) {
             targetFormatVersion = PCK_VERSION_V3;
-            hasExplicitVersion = true;
+            hasExplicitFormat = true;
         } else if (strcmp(argv[i], "--v4") == 0) {
             targetFormatVersion = PCK_VERSION_V4;
-            hasExplicitVersion = true;
+            hasExplicitFormat = true;
         } else if (strcmp(argv[i], "--engine") == 0) {
             if (i + 1 >= argc) usage();
             if (!parseEngineVersion(argv[++i], &explicitEngineVersion))
-                panic("Invalid --engine: expected <major.minor.patch> (e.g., 4.3.0)");
+                panic("Invalid --engine: expected M.m.p (e.g. 4.3.0)");
             hasExplicitEngine = true;
         } else if (strcmp(argv[i], "--copy-meta") == 0) {
             if (i + 1 >= argc) usage();
             copyMetaPath = argv[++i];
-        } else if (strcmp(argv[i], "--embed") == 0) {
-            if (i + 1 >= argc) usage();
-            embedExePath = argv[++i];
-        } else if (strcmp(argv[i], "--filter") == 0) {
-            if (i + 1 >= argc) usage();
-            if (filterExtList) {
-                freeFilterExtensions(filterExtList, filterExtCount);
-                filterExtList = NULL;
-                filterExtCount = 0;
-            }
-            filterExtList = parseFilterExtensions(argv[++i], &filterExtCount);
         } else if (strcmp(argv[i], "--key") == 0) {
             if (i + 1 >= argc) usage();
             if (!parseHexKey256(argv[++i], decryptOpts.key))
@@ -245,73 +263,74 @@ int main(int argc, char** argv) {
             if (i + 1 >= argc) usage();
             loadKeyFromFile(argv[++i], decryptOpts.key);
             decryptOpts.hasKey = true;
+        } else if (strcmp(argv[i], "--filter") == 0) {
+            if (i + 1 >= argc) usage();
+            if (filterExts) {
+                freeFilterExtensions(filterExts, filterCount);
+                filterExts = NULL;
+                filterCount = 0;
+            }
+            parseFilterExtensions(argv[++i], &filterExts, &filterCount);
+        } else if (strcmp(argv[i], "--embed") == 0) {
+            if (i + 1 >= argc) usage();
+            embedExePath = argv[++i];
         } else {
             usage();
         }
     }
 
-    if ((embedExePath || copyMetaPath || hasExplicitVersion || hasExplicitEngine) && !isPackMode)
-        panic("--embed, --copy-meta, --engine, and --v1..--v4 are only valid in pack mode");
+    if (embedExePath && !isPackMode)
+        panic("--embed is only supported in pack mode");
 
-    if ((decryptOpts.hasKey || filterExtList != NULL) && isPackMode)
-        panic("--key, --key-file, and --filter are only valid in list or unpack mode");
+    if (copyMetaPath && !isPackMode)
+        panic("--copy-meta is only supported in pack mode");
+
+    if (hasExplicitEngine && !isPackMode)
+        panic("--engine is only supported in pack mode");
+
+    if (filterCount > 0 && isPackMode)
+        panic("--filter is only supported in list and unpack modes");
 
     PckFilterOptions filterOpts = {
-        .extensions = (const char* const*)filterExtList,
-        .count = filterExtCount
+        .extensions = (const char* const*)filterExts,
+        .count = filterCount
     };
 
     if (isListMode) {
         FileHandle fileHndl = FileCreateHandle(inputPath);
         PckPreprocess(fileHndl.data_u8, fileHndl.size, &decryptOpts);
-        PckListAll(fileHndl.data_u8, fileHndl.size, &decryptOpts, filterExtCount > 0 ? &filterOpts : NULL);
+        PckListAll(fileHndl.data_u8, fileHndl.size, &decryptOpts, &filterOpts);
         FileDestroyHandle(fileHndl);
     } else if (isUnpackMode) {
         FileHandle fileHndl = FileCreateHandle(inputPath);
         PckPreprocess(fileHndl.data_u8, fileHndl.size, &decryptOpts);
-        PckExtractAll(fileHndl.data_u8, fileHndl.size, outputPath, &decryptOpts, filterExtCount > 0 ? &filterOpts : NULL);
+        PckExtractAll(fileHndl.data_u8, fileHndl.size, outputPath, &decryptOpts, &filterOpts);
         FileDestroyHandle(fileHndl);
-        printf("Done -> %s/\n", outputPath);
+        printDoneLine60(outputPath, true);
     } else if (isPackMode) {
-        if (embedExePath) {
-            char* realEmbed = realpath(embedExePath, NULL);
-            char* realOut   = realpath(outputPath, NULL);
-            bool sameFile   = false;
+        if (embedExePath && pathsReferToSameFile(embedExePath, outputPath))
+            panic("Refusing to overwrite --embed input executable in-place: \"%s\"", outputPath);
 
-            if (realEmbed && realOut && strcmp(realEmbed, realOut) == 0)
-                sameFile = true;
-            else if (strcmp(embedExePath, outputPath) == 0)
-                sameFile = true;
-
-            free(realEmbed);
-            free(realOut);
-
-            if (sameFile)
-                panic("Output path \"%s\" cannot be the same file as --embed input", outputPath);
-        }
-
-        u32 resolvedFormat = PCK_VERSION_LATEST;
+        u32 resolvedFormat = targetFormatVersion;
         PckEngineVersion resolvedEngine = {
-            .majorVersion = 4,
+            .majorVersion = (resolvedFormat == PCK_VERSION_V1) ? 3 : 4,
             .minorVersion = 6,
             .patchVersion = 0
         };
 
         if (copyMetaPath) {
-            FileHandle metaHndl = FileCreateHandle(copyMetaPath);
-            PckMetadata meta = PckReadMetadata(metaHndl.data_u8, metaHndl.size);
-            FileDestroyHandle(metaHndl);
+            FileHandle refHndl = FileCreateHandle(copyMetaPath);
+            PckMetadata meta = PckReadMetadata(refHndl.data_u8, refHndl.size);
+            FileDestroyHandle(refHndl);
 
             resolvedFormat = meta.formatVersion;
             resolvedEngine = meta.engineVersion;
         }
 
-        if (hasExplicitVersion) {
+        if (hasExplicitFormat) {
             resolvedFormat = targetFormatVersion;
-            if (!copyMetaPath && !hasExplicitEngine && resolvedFormat == PCK_VERSION_V1) {
-                resolvedEngine.majorVersion = 3;
-                resolvedEngine.minorVersion = 6;
-                resolvedEngine.patchVersion = 0;
+            if (!copyMetaPath && !hasExplicitEngine) {
+                resolvedEngine.majorVersion = (resolvedFormat == PCK_VERSION_V1) ? 3 : 4;
             }
         }
 
@@ -339,9 +358,9 @@ int main(int argc, char** argv) {
             free(buildFiles[i].archivePath);
         }
         free(buildFiles);
-        printf("Done -> %s\n", outputPath);
+        printDoneLine60(outputPath, false);
     }
 
-    freeFilterExtensions(filterExtList, filterExtCount);
+    freeFilterExtensions(filterExts, filterCount);
     return 0;
 }

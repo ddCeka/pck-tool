@@ -27,7 +27,7 @@ typedef struct {
 } PckDecryptOptions;
 
 typedef struct {
-    const char* const* extensions; // Normalized with leading '.', e.g. ".oggstr"
+    const char* const* extensions;
     u32 count;
 } PckFilterOptions;
 
@@ -50,8 +50,8 @@ void PckListAll(
 );
 
 typedef struct {
-    char* diskPath;    // Full path on local filesystem
-    char* archivePath; // Relative path inside archive (without root directory)
+    char* diskPath;
+    char* archivePath;
 } PckBuildInput;
 
 void PckBuildToFile(

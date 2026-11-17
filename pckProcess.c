@@ -139,7 +139,6 @@ static PckResolvedView _PckResolveView(const u8* fileData, u64 fileSize) {
     if (fileSize < PCK_HEADER_PREFIX_SIZE + sizeof(u32))
         panic("PckPreprocess: File too small to be a valid PCK");
 
-    // 1. Check standalone PCK (starts directly with "GDPC")
     if (read_u32_le(fileData) == GDPC_MAGIC) {
         view.pckStart = fileData;
         view.pckRegionSize = fileSize;
@@ -148,7 +147,6 @@ static PckResolvedView _PckResolveView(const u8* fileData, u64 fileSize) {
         return view;
     }
 
-    // 2. Check embedded PCK footer at end of executable: [u64 pckSize][u32 "GDPC"]
     if (fileSize >= PCK_EMBED_FOOTER_SIZE + PCK_HEADER_PREFIX_SIZE + sizeof(u32)) {
         const u8* footer = fileData + fileSize - PCK_EMBED_FOOTER_SIZE;
         u32 footerMagic = read_u32_le(footer + sizeof(u64));
@@ -480,7 +478,6 @@ void PckExtractAll(
     PckDirSession sess = _PckOpenDirSession(&view, decryptOpts, md5Context);
     bool hasFilter = (filterOpts && filterOpts->count > 0);
 
-    // 60-col header: "Unpack v3 | Godot 4.6.0 [EMB] [FLT] | 99999 files"
     char headerBuf[128];
     snprintf(headerBuf, sizeof(headerBuf), "Unpack v%u | Godot %u.%u.%u%s%s | %u files",
              sess.formatVersion,
@@ -502,7 +499,6 @@ void PckExtractAll(
         if (!_PckMatchesFilter(entry.namePtr, entry.nameLen, filterOpts))
             continue;
 
-        // 60-col row: "  <41-char path> <9-char size> <6-char status>" = 2 + 41 + 1 + 9 + 1 + 6 = 60
         char sizeStr[16];
         char shortName[44];
         _PckFormatSize(entry.dataSize, sizeStr, sizeof(sizeStr));
@@ -682,7 +678,6 @@ void PckListAll(
 
     qsort(items, matchedCount, sizeof(PckListEntry), _CompareListEntriesDesc);
 
-    // 60-col header
     char headerBuf[128];
     snprintf(headerBuf, sizeof(headerBuf), "PCK v%u | Godot %u.%u.%u%s%s%s | %u files",
              sess.formatVersion,
@@ -886,6 +881,7 @@ void PckBuildToFile(
         formatVersion != PCK_VERSION_V2 &&
         formatVersion != PCK_VERSION_V3 &&
         formatVersion != PCK_VERSION_V4) {
+        // TODO: rewrite this panic message later
         panic("PckBuildToFile: Unsupported target format version %u", formatVersion);
     }
 
@@ -957,7 +953,6 @@ void PckBuildToFile(
     _PckPrintLine60(headerBuf);
     _PckPrintRule();
 
-    // 1. Write PCK header at baseOffset
     u8 hdr[PCK_HEADER_V2_SIZE] = { 0 };
     write_u32_le(hdr + 0,  GDPC_MAGIC);
     write_u32_le(hdr + 4,  formatVersion);
@@ -977,7 +972,6 @@ void PckBuildToFile(
     }
     _PckWriteAll(outFp, hdr, headerSize);
 
-    // 2. Allocate directory buffer in memory
     u8* dirBuf = calloc(1, (size_t)entrySectionSize);
     if (!dirBuf) {
         free(streamBuf);
@@ -1001,12 +995,11 @@ void PckBuildToFile(
     MD5Context md5Context = _PckCreateMD5Context();
     u64 currentDataPos = dataSectionOffset;
 
-    // 3. Stream each asset in 64 KB chunks while hashing and recording directory entries
     for (u32 i = 0; i < fileCount; i++) {
         size_t rawNameLen = _PckFormatGodotUri(files[i].archivePath, uriBuf, sizeof(uriBuf));
         u64 paddedNameLen = _PckAlignU64(rawNameLen, PCK_ALIGNMENT_V2);
 
-        // 60-col row: "  <42-char path> <9-char size> <5-char status>" = 2 + 42 + 1 + 9 + 1 + 5 = 60
+        // <42-char path> <9-char size> <5-char status> = 2 + 42 + 1 + 9 + 1 + 5 = 60
         char sizeStr[16];
         char shortName[44];
         _PckFormatSize(fileSizes[i], sizeStr, sizeof(sizeStr));
@@ -1067,13 +1060,11 @@ void PckBuildToFile(
         printf("   OK\n");
     }
 
-    // 4. Write directory table
     if (fseeko(outFp, (off_t)(baseOffset + dirSectionOffset), SEEK_SET) != 0)
         panic("PckBuildToFile: fseeko to directory section failed");
 
     _PckWriteAll(outFp, dirBuf, (size_t)entrySectionSize);
 
-    // 5. Append 12-byte embedded footer if bundling into an executable
     if (embedExePath != NULL) {
         if (fseeko(outFp, (off_t)(baseOffset + totalPckSize), SEEK_SET) != 0)
             panic("PckBuildToFile: fseeko to embedded footer failed");

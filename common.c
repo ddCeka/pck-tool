@@ -62,11 +62,11 @@ bool sanitizeRelPath(const char* relPath, size_t len) {
         if (i == len || relPath[i] == '/') {
             size_t segLen = i - segStart;
             if (segLen == 0)
-                return false; // Reject double slashes "//"
+                return false;
             if (segLen == 1 && relPath[segStart] == '.')
-                return false; // Reject "."
+                return false;
             if (segLen == 2 && relPath[segStart] == '.' && relPath[segStart + 1] == '.')
-                return false; // Reject ".." (Zip Slip)
+                return false;
             segStart = i + 1;
         }
     }
