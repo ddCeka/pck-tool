@@ -1,30 +1,35 @@
 # pckt
 
-A fast, lightweight command-line tool written in C for inspecting, unpacking, and building Godot `.pck` archives and self-contained executables (Godot PCK formats **v1–v4**).
+A fast, lightweight command-line tool written in C for inspecting, unpacking, and repacking Godot Engine `.pck` archives and self-contained game executables.
+
+Designed for asset optimization and game modding workflows, `pckt` uses memory-mapped I/O (`mmap`) and chunked disk streaming so multi-gigabyte game archives can be unpacked or rebuilt with minimal RAM usage.
 
 ## Features
-- **Zero-Copy & Streaming I/O:** Uses `mmap` for `list` and `unpack` and 64 KB chunked disk streaming for `pack`, keeping memory usage minimal even on multi-gigabyte archives.
-- **Standalone & Embedded Support:** Reads and writes standalone `.pck` files as well as self-contained Windows/Linux/macOS executables (`--embed`).
-- **Metadata Cloning:** Automatically matches the original game's PCK format version and Godot engine version via `--copy-meta` or `--engine`.
-- **Deterministic Builds:** Sorts input paths lexicographically so packing the same directory produces byte-for-byte identical archives across filesystems.
-- **AES-256-CFB Decryption:** Supports decrypting V2–V4 encrypted directories and files via `--key` or `--key-file`.
-- **Hardened Parser:** Protects against Zip Slip path traversal, unaligned memory access, and integer overflows.
+
+- **Format Support:** Reads and writes Godot PCK format versions **v1, v2, v3, and v4**.
+- **Embedded Executables:** Unpacks directly from self-contained Windows (`.exe`), Linux, and macOS binaries, and bundles or replaces `.pck` payloads inside executables via `--embed`.
+- **Metadata Matching:** Clones exact PCK format and Godot engine versions from existing archives or executables using `--copy-meta` or `--engine`.
+- **Extension Filtering:** Inspect or extract specific asset types (such as `.ctex`, `.stex`, `.oggstr`, or `.oggvorbisstr`) using `--filter`.
+- **Encrypted Archives:** Decrypts AES-256-CFB encrypted directories and files during `list` and `unpack` via `--key` or `--key-file`.
+- **Low-Memory I/O & Deterministic Builds:** Uses read-only `mmap` for archive reading, 64 KB chunked file streaming for packing, deterministic alphabetical file sorting, and strict path traversal protection.
 
 ## Usage
 
-```text
-pckt <unpack|pack|list> <in> [out] [options]
+```bash
+pckt <list|unpack|pack> <in> [out] [options]
 ```
 
 ### Options
-| Option | Mode | Description |
+
+| Option | Modes | Description |
 | :--- | :--- | :--- |
-| `--v1`, `--v2`, `--v3`, `--v4` | `pack` | Target PCK format version (default: `v3`). |
-| `--engine <M.m.p>` | `pack` | Set the Godot engine version in the header (e.g. `4.3.0`). |
-| `--copy-meta <pck\|exe>` | `pack` | Copy the PCK format and Godot engine version from an existing archive or executable. |
-| `--embed <exe>` | `pack` | Bundle the packed archive into a Godot executable (strips any previously embedded PCK first). |
-| `--key <64-hex>` | `unpack`, `list` | 64-character hexadecimal AES-256 decryption key. |
-| `--key-file <path>` | `unpack`, `list` | Read the 64-character hexadecimal AES-256 key from a file. |
+| `--filter <ext1,ext2,...>` | `list`, `unpack` | Only process files matching the comma-separated extensions (case-insensitive, leading dot optional). |
+| `--key <64-hex>` | `list`, `unpack` | 64-character hexadecimal AES-256 decryption key. |
+| `--key-file <path>` | `list`, `unpack` | Read the 64-character hex decryption key from a file. |
+| `--v1` \| `--v2` \| `--v3` \| `--v4` | `pack` | Target PCK format version (default: `v3`). |
+| `--engine <M.m.p>` | `pack` | Set the Godot engine version header (e.g., `4.3.0` or `3.5.3`). |
+| `--copy-meta <pck\|exe>` | `pack` | Copy PCK format and engine version metadata from an original `.pck` or executable. |
+| `--embed <exe>` | `pack` | Bundle the packed archive into a base executable (replaces any existing embedded `.pck`). |
 
 ### Examples
 
@@ -32,25 +37,27 @@ pckt <unpack|pack|list> <in> [out] [options]
   ```bash
   pckt list ./Game.pck
   ```
-
-- **Unpack a standalone `.pck` or self-contained executable:**
+- **Inspect only compiled audio or texture assets:**
   ```bash
-  pckt unpack ./Game.pck ./game_files
+  pckt list ./Game.pck --filter .oggstr,.oggvorbisstr,.ctex
+  ```
+- **Unpack an archive or self-contained executable:**
+  ```bash
   pckt unpack ./Game.exe ./game_files
   ```
-
+- **Extract only audio streams for re-encoding (e.g., with `ffmpeg`):**
+  ```bash
+  pckt unpack ./Game.pck ./audio_only --filter oggstr,oggvorbisstr,sample
+  ```
 - **Unpack an encrypted archive:**
   ```bash
-  pckt unpack ./Game.pck ./game_files --key 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
   pckt unpack ./Game.pck ./game_files --key-file ./godot.gdkey
   ```
-
-- **Repack modified assets matching the original game's metadata:**
+- **Repack a directory matching the original game's format and Godot version:**
   ```bash
   pckt pack ./game_files ./Game_patched.pck --copy-meta ./Game.pck
   ```
-
-- **Re-bundle modified assets directly into a Godot executable:**
+- **Repack and re-embed directly into a game executable:**
   ```bash
   pckt pack ./game_files ./Game_patched.exe --copy-meta ./Game.exe --embed ./Game.exe
   ```
@@ -58,25 +65,29 @@ pckt <unpack|pack|list> <in> [out] [options]
 ## Building & Testing
 
 ### Prerequisites
-- C11-compatible compiler (`gcc` or `clang`)
-- `make`
-- OpenSSL development headers (`libssl-dev` on Debian/Ubuntu, `openssl@3` via Homebrew on macOS)
+
+- A C11-compatible compiler (`gcc` or `clang`)
+- GNU `make`
+- OpenSSL development headers and `libcrypto` (`libssl-dev` on Debian/Ubuntu, `openssl-devel` on Fedora, or `brew install openssl@3` on macOS)
 
 ### Commands
-- **Build the binary:**
-  ```bash
-  make
-  ```
-- **Run the test suite:**
-  ```bash
-  make test
-  ```
-- **Run tests with AddressSanitizer & UndefinedBehaviorSanitizer:**
-  ```bash
-  make debug
-  ```
-- **Strip debug symbols or install system-wide:**
-  ```bash
-  make strip
-  sudo make install
-  ```
+
+```bash
+# Build the pckt binary
+make
+
+# Run the automated unit and CLI integration test suite
+make test
+
+# Build and run tests with AddressSanitizer and UndefinedBehaviorSanitizer
+make debug
+
+# Strip symbols from the release binary
+make strip
+
+# Install to /usr/local/bin (override with PREFIX=/custom/path)
+sudo make install
+
+# Remove build artifacts
+make clean
+```

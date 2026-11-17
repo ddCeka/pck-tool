@@ -3,6 +3,7 @@
 
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <openssl/evp.h>
 
 #ifndef _WIN32
@@ -231,24 +232,6 @@ static u8* _PckDecryptStream(
     return decryptedBuf;
 }
 
-PckMetadata PckReadMetadata(const u8* pckData, u64 pckSize) {
-    PckResolvedView view = _PckResolveView(pckData, pckSize);
-    PckMetadata meta = { 0 };
-    meta.formatVersion = read_u32_le(view.pckStart + 4);
-
-    if (meta.formatVersion != PCK_VERSION_V1 &&
-        meta.formatVersion != PCK_VERSION_V2 &&
-        meta.formatVersion != PCK_VERSION_V3 &&
-        meta.formatVersion != PCK_VERSION_V4) {
-        panic("PckReadMetadata: Unsupported PCK format version %u (expected 1..4)", meta.formatVersion);
-    }
-
-    meta.engineVersion.majorVersion = read_u32_le(view.pckStart + 8);
-    meta.engineVersion.minorVersion = read_u32_le(view.pckStart + 12);
-    meta.engineVersion.patchVersion = read_u32_le(view.pckStart + 16);
-    return meta;
-}
-
 void PckPreprocess(const u8* pckData, u64 pckSize, const PckDecryptOptions* decryptOpts) {
     PckResolvedView view = _PckResolveView(pckData, pckSize);
     u32 formatVersion = read_u32_le(view.pckStart + 4);
@@ -278,6 +261,24 @@ void PckPreprocess(const u8* pckData, u64 pckSize, const PckDecryptOptions* decr
         panic("PckPreprocess: Sparse bundle PCK is not supported");
 }
 
+PckMetadata PckReadMetadata(const u8* pckData, u64 pckSize) {
+    PckResolvedView view = _PckResolveView(pckData, pckSize);
+    PckMetadata meta = { 0 };
+    meta.formatVersion = read_u32_le(view.pckStart + 4);
+
+    if (meta.formatVersion != PCK_VERSION_V1 &&
+        meta.formatVersion != PCK_VERSION_V2 &&
+        meta.formatVersion != PCK_VERSION_V3 &&
+        meta.formatVersion != PCK_VERSION_V4) {
+        panic("PckReadMetadata: Unsupported PCK format version %u (expected 1..4)", meta.formatVersion);
+    }
+
+    meta.engineVersion.majorVersion = read_u32_le(view.pckStart + 8);
+    meta.engineVersion.minorVersion = read_u32_le(view.pckStart + 12);
+    meta.engineVersion.patchVersion = read_u32_le(view.pckStart + 16);
+    return meta;
+}
+
 static void _PckFormatSize(u64 sizeInBytes, char* stringRep, size_t bufSize) {
     if (sizeInBytes < 1024ULL) {
         snprintf(stringRep, bufSize, "%llu B", (unsigned long long)sizeInBytes);
@@ -288,6 +289,42 @@ static void _PckFormatSize(u64 sizeInBytes, char* stringRep, size_t bufSize) {
     } else {
         snprintf(stringRep, bufSize, "%.2f GB", (double)sizeInBytes / (1024.0 * 1024.0 * 1024.0));
     }
+}
+
+static bool _PckMatchesFilter(const char* namePtr, size_t nameLen, const PckFilterOptions* filterOpts) {
+    if (!filterOpts || filterOpts->count == 0)
+        return true;
+
+    size_t lastSlash = 0;
+    bool hasSlash = false;
+    for (size_t i = 0; i < nameLen; i++) {
+        if (namePtr[i] == '/') {
+            lastSlash = i + 1;
+            hasSlash = true;
+        }
+    }
+
+    size_t start = hasSlash ? lastSlash : 0;
+    size_t lastDot = nameLen;
+    for (size_t i = start; i < nameLen; i++) {
+        if (namePtr[i] == '.')
+            lastDot = i;
+    }
+
+    if (lastDot >= nameLen)
+        return false;
+
+    const char* entryExt = namePtr + lastDot;
+    size_t entryExtLen = nameLen - lastDot;
+
+    for (u32 i = 0; i < filterOpts->count; i++) {
+        const char* target = filterOpts->extensions[i];
+        size_t targetLen = strlen(target);
+        if (targetLen == entryExtLen && strncasecmp(entryExt, target, entryExtLen) == 0)
+            return true;
+    }
+
+    return false;
 }
 
 typedef struct {
@@ -418,23 +455,36 @@ static bool _PckReadNextEntry(PckDirSession* sess, u32 idx, PckParsedEntry* outE
     return true;
 }
 
-void PckExtractAll(const u8* pckData, u64 pckSize, const char* outputDirectory, const PckDecryptOptions* decryptOpts) {
+void PckExtractAll(
+    const u8* pckData,
+    u64 pckSize,
+    const char* outputDirectory,
+    const PckDecryptOptions* decryptOpts,
+    const PckFilterOptions* filterOpts
+) {
     PckResolvedView view = _PckResolveView(pckData, pckSize);
     MD5Context md5Context = _PckCreateMD5Context();
     PckDirSession sess = _PckOpenDirSession(&view, decryptOpts, md5Context);
 
-    printf("Unpack v%u (Godot %u.%u.%u)%s | %u files\n",
+    bool hasFilter = (filterOpts != NULL && filterOpts->count > 0);
+    u32 extractedCount = 0;
+
+    printf("Unpack v%u (Godot %u.%u.%u)%s%s | %u files\n",
            sess.formatVersion,
            sess.engineVersion.majorVersion,
            sess.engineVersion.minorVersion,
            sess.engineVersion.patchVersion,
            view.isEmbedded ? " [EMB]" : "",
+           hasFilter ? " [FILTER]" : "",
            sess.fileCount);
     _PckPrintRule();
 
     for (u32 i = 0; i < sess.fileCount; i++) {
         PckParsedEntry entry;
         _PckReadNextEntry(&sess, i, &entry);
+
+        if (!_PckMatchesFilter(entry.namePtr, entry.nameLen, filterOpts))
+            continue;
 
         char sizeStr[16];
         char shortName[48];
@@ -547,10 +597,15 @@ void PckExtractAll(const u8* pckData, u64 pckSize, const char* outputDirectory, 
         if (decryptedFileBuf)
             free(decryptedFileBuf);
 
+        extractedCount++;
         printf("  OK\n");
     }
 
     _PckPrintRule();
+    if (hasFilter) {
+        printf("Extracted %u / %u files\n", extractedCount, sess.fileCount);
+    }
+
     _PckCloseDirSession(&sess);
     _PckEndMD5Context(md5Context);
 }
@@ -569,7 +624,12 @@ static int _CompareListEntriesDesc(const void* a, const void* b) {
     return strcmp(ea->name, eb->name);
 }
 
-void PckListAll(const u8* pckData, u64 pckSize, const PckDecryptOptions* decryptOpts) {
+void PckListAll(
+    const u8* pckData,
+    u64 pckSize,
+    const PckDecryptOptions* decryptOpts,
+    const PckFilterOptions* filterOpts
+) {
     PckResolvedView view = _PckResolveView(pckData, pckSize);
     MD5Context md5Context = _PckCreateMD5Context();
     PckDirSession sess = _PckOpenDirSession(&view, decryptOpts, md5Context);
@@ -581,38 +641,45 @@ void PckListAll(const u8* pckData, u64 pckSize, const PckDecryptOptions* decrypt
     if (!items)
         panic("PckListAll: calloc failed");
 
-    u64 totalPayloadBytes = 0;
+    bool hasFilter = (filterOpts != NULL && filterOpts->count > 0);
+    u32 matchedCount = 0;
+    u64 matchedPayloadBytes = 0;
 
     for (u32 i = 0; i < sess.fileCount; i++) {
         PckParsedEntry entry;
         _PckReadNextEntry(&sess, i, &entry);
 
-        items[i].name = malloc(entry.nameLen + 1);
-        if (!items[i].name)
-            panic("PckListAll: malloc failed");
-        memcpy(items[i].name, entry.namePtr, entry.nameLen);
-        items[i].name[entry.nameLen] = '\0';
+        if (!_PckMatchesFilter(entry.namePtr, entry.nameLen, filterOpts))
+            continue;
 
-        items[i].size = entry.dataSize;
-        items[i].flags = entry.flags;
-        totalPayloadBytes += entry.dataSize;
+        items[matchedCount].name = malloc(entry.nameLen + 1);
+        if (!items[matchedCount].name)
+            panic("PckListAll: malloc failed");
+        memcpy(items[matchedCount].name, entry.namePtr, entry.nameLen);
+        items[matchedCount].name[entry.nameLen] = '\0';
+
+        items[matchedCount].size = entry.dataSize;
+        items[matchedCount].flags = entry.flags;
+        matchedPayloadBytes += entry.dataSize;
+        matchedCount++;
     }
 
-    qsort(items, sess.fileCount, sizeof(PckListEntry), _CompareListEntriesDesc);
+    qsort(items, matchedCount, sizeof(PckListEntry), _CompareListEntriesDesc);
 
-    printf("PCK v%u | Godot %u.%u.%u%s%s | %u files\n",
+    printf("PCK v%u | Godot %u.%u.%u%s%s%s | %u files\n",
            sess.formatVersion,
            sess.engineVersion.majorVersion,
            sess.engineVersion.minorVersion,
            sess.engineVersion.patchVersion,
            view.isEmbedded ? " | EMB" : "",
            sess.isDirEncrypted ? " | ENC" : "",
+           hasFilter ? " | FILTER" : "",
            sess.fileCount);
     _PckPrintRule();
     printf("%9s %-44s %4s\n", "SIZE", "ASSET", "FLAG");
     _PckPrintRule();
 
-    for (u32 i = 0; i < sess.fileCount; i++) {
+    for (u32 i = 0; i < matchedCount; i++) {
         char sizeStr[16];
         char shortName[48];
         _PckFormatSize(items[i].size, sizeStr, sizeof(sizeStr));
@@ -628,12 +695,20 @@ void PckListAll(const u8* pckData, u64 pckSize, const PckDecryptOptions* decrypt
     free(items);
 
     char totalStr[24];
-    _PckFormatSize(totalPayloadBytes, totalStr, sizeof(totalStr));
+    _PckFormatSize(matchedPayloadBytes, totalStr, sizeof(totalStr));
     _PckPrintRule();
-    printf("Total: %u files | %s (%llu B)\n",
-           sess.fileCount,
-           totalStr,
-           (unsigned long long)totalPayloadBytes);
+    if (hasFilter) {
+        printf("Total: %u / %u files | %s (%llu B)\n",
+               matchedCount,
+               sess.fileCount,
+               totalStr,
+               (unsigned long long)matchedPayloadBytes);
+    } else {
+        printf("Total: %u files | %s (%llu B)\n",
+               sess.fileCount,
+               totalStr,
+               (unsigned long long)matchedPayloadBytes);
+    }
 
     _PckCloseDirSession(&sess);
     _PckEndMD5Context(md5Context);
@@ -842,9 +917,9 @@ void PckBuildToFile(
     }
 
     u64 baseOffset = 0;
-    bool replacedExisting = false;
+    bool replacedExistingPck = false;
     if (embedExePath != NULL) {
-        _PckCopyExeStub(embedExePath, outFp, streamBuf, &baseOffset, &replacedExisting);
+        _PckCopyExeStub(embedExePath, outFp, streamBuf, &baseOffset, &replacedExistingPck);
     }
 
     char totalStr[24];
@@ -854,7 +929,7 @@ void PckBuildToFile(
            engineVersion.majorVersion,
            engineVersion.minorVersion,
            engineVersion.patchVersion,
-           embedExePath ? (replacedExisting ? " [RE-EMB]" : " [EMB]") : "",
+           embedExePath ? (replacedExistingPck ? " [RE-EMBED]" : " [EMBED]") : "",
            fileCount,
            totalStr);
     _PckPrintRule();
@@ -892,7 +967,7 @@ void PckBuildToFile(
     write_u32_le(dirCursor, fileCount);
     dirCursor += sizeof(u32);
 
-    // Seek to start of data section (leaves zeroed space for V1/V2 directory)
+    // Seek to start of data section inside the PCK region
     if (fseeko(outFp, (off_t)(baseOffset + dataSectionOffset), SEEK_SET) != 0) {
         free(dirBuf);
         fclose(outFp);
@@ -969,13 +1044,13 @@ void PckBuildToFile(
         printf("  OK\n");
     }
 
-    // 4. Seek to dirSectionOffset and flush directory table
+    // 4. Write directory table at baseOffset + dirSectionOffset
     if (fseeko(outFp, (off_t)(baseOffset + dirSectionOffset), SEEK_SET) != 0)
         panic("PckBuildToFile: fseeko to directory section failed");
 
     _PckWriteAll(outFp, dirBuf, (size_t)entrySectionSize);
 
-    // 5. If embedding into an executable, write the 12-byte footer at the end
+    // 5. If embedding into an executable, append the 12-byte footer at the end of the PCK
     if (embedExePath != NULL) {
         if (fseeko(outFp, (off_t)(baseOffset + totalPckSize), SEEK_SET) != 0)
             panic("PckBuildToFile: fseeko to embedded footer failed");

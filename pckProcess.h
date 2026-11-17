@@ -26,10 +26,28 @@ typedef struct {
     u8 key[32];
 } PckDecryptOptions;
 
-void PckPreprocess(const u8* pckData, u64 pckSize, const PckDecryptOptions* decryptOpts);
+typedef struct {
+    const char* const* extensions; // Normalized with leading '.', e.g. ".oggstr"
+    u32 count;
+} PckFilterOptions;
+
 PckMetadata PckReadMetadata(const u8* pckData, u64 pckSize);
-void PckExtractAll(const u8* pckData, u64 pckSize, const char* outputDirectory, const PckDecryptOptions* decryptOpts);
-void PckListAll(const u8* pckData, u64 pckSize, const PckDecryptOptions* decryptOpts);
+void PckPreprocess(const u8* pckData, u64 pckSize, const PckDecryptOptions* decryptOpts);
+
+void PckExtractAll(
+    const u8* pckData,
+    u64 pckSize,
+    const char* outputDirectory,
+    const PckDecryptOptions* decryptOpts,
+    const PckFilterOptions* filterOpts
+);
+
+void PckListAll(
+    const u8* pckData,
+    u64 pckSize,
+    const PckDecryptOptions* decryptOpts,
+    const PckFilterOptions* filterOpts
+);
 
 typedef struct {
     char* diskPath;    // Full path on local filesystem
