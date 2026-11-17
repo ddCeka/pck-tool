@@ -62,11 +62,11 @@ bool sanitizeRelPath(const char* relPath, size_t len) {
         if (i == len || relPath[i] == '/') {
             size_t segLen = i - segStart;
             if (segLen == 0)
-                return false;
+                return false; // Reject double slashes "//"
             if (segLen == 1 && relPath[segStart] == '.')
-                return false;
+                return false; // Reject "."
             if (segLen == 2 && relPath[segStart] == '.' && relPath[segStart + 1] == '.')
-                return false;
+                return false; // Reject ".." (Zip Slip)
             segStart = i + 1;
         }
     }
@@ -141,12 +141,48 @@ static void _getAllFiles(const char* path, size_t rootLength, GetAllFilesResult*
 
                 result->fullFilenames[result->fileCount] = strdup(fullPath);
                 result->truncatedFilenames[result->fileCount] = strdup(fullPath + rootLength + 1);
+                if (!result->fullFilenames[result->fileCount] || !result->truncatedFilenames[result->fileCount])
+                    panic("_getAllFiles: strdup failed");
                 result->fileCount++;
             }
         }
     }
 
     closedir(dir);
+}
+
+typedef struct {
+    char* full;
+    char* truncated;
+} FileEntryPair;
+
+static int _CompareFileEntryPairs(const void* a, const void* b) {
+    const FileEntryPair* pa = (const FileEntryPair*)a;
+    const FileEntryPair* pb = (const FileEntryPair*)b;
+    return strcmp(pa->truncated, pb->truncated);
+}
+
+static void _sortAllFiles(GetAllFilesResult* result) {
+    if (result->fileCount <= 1)
+        return;
+
+    FileEntryPair* pairs = malloc(sizeof(FileEntryPair) * result->fileCount);
+    if (!pairs)
+        panic("_sortAllFiles: malloc failed");
+
+    for (unsigned i = 0; i < result->fileCount; i++) {
+        pairs[i].full = result->fullFilenames[i];
+        pairs[i].truncated = result->truncatedFilenames[i];
+    }
+
+    qsort(pairs, result->fileCount, sizeof(FileEntryPair), _CompareFileEntryPairs);
+
+    for (unsigned i = 0; i < result->fileCount; i++) {
+        result->fullFilenames[i] = pairs[i].full;
+        result->truncatedFilenames[i] = pairs[i].truncated;
+    }
+
+    free(pairs);
 }
 
 GetAllFilesResult getAllFiles(const char* rootPath) {
@@ -163,6 +199,7 @@ GetAllFilesResult getAllFiles(const char* rootPath) {
         rootLen--;
 
     _getAllFiles(rootPath, rootLen, &result, &capacity);
+    _sortAllFiles(&result);
     return result;
 }
 
